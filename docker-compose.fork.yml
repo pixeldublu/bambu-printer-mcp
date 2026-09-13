@@ -1,0 +1,90 @@
+# BambuStudio + pixeldublu/bambu-printer-mcp
+# Deploy from Portainer using this stack. Keep the three printer variables in
+# Portainer's environment/secrets; do not paste credentials into this YAML.
+
+services:
+  bambustudio:
+    image: lscr.io/linuxserver/bambustudio:latest
+    container_name: bambustudio
+    restart: unless-stopped
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /custom-services.d /custom-cont-init.d
+
+        cat > /custom-services.d/bambu-mcp <<'EOF'
+        #!/bin/bash
+        set -euo pipefail
+        while [ ! -f /opt/bambu-printer-mcp-src/.init-ok ]; do sleep 2; done
+        mkdir -p /config/.XDG
+        exec s6-envdir /var/run/s6/container_environment \
+          s6-setuidgid abc /usr/bin/env \
+          LD_LIBRARY_PATH=/opt/bambustudio/bin:/opt/bambustudio/lib:/opt/bambustudio/usr/lib \
+          XDG_RUNTIME_DIR=/config/.XDG \
+          WAYLAND_DISPLAY=wayland-1 DISPLAY=:1 \
+          node /opt/bambu-printer-mcp-src/dist/index.js
+        EOF
+        chmod +x /custom-services.d/bambu-mcp
+
+        cat > /custom-cont-init.d/01-install-mcp.sh <<'EOF'
+        #!/bin/bash
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        if [ -f /opt/bambu-printer-mcp-src/.init-ok ]; then exit 0; fi
+        apt-get update
+        apt-get install -y --no-install-recommends nodejs git curl python3 ca-certificates
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+        rm -rf /opt/bambu-printer-mcp-src
+        git clone https://github.com/pixeldublu/bambu-printer-mcp.git /opt/bambu-printer-mcp-src
+        cd /opt/bambu-printer-mcp-src
+        npm ci --no-audit --no-fund
+        npm run build
+        npm prune --omit=dev
+        test -s dist/index.js
+        test -s dist/printers/bambu.js
+        test -s dist/stl/stl-manipulator.js
+        mkdir -p /Applications/BambuStudio.app/Contents/Resources/profiles
+        rm -rf /Applications/BambuStudio.app/Contents/Resources/profiles/BBL
+        ln -s /config/.config/BambuStudio/system/BBL /Applications/BambuStudio.app/Contents/Resources/profiles/BBL
+        touch /opt/bambu-printer-mcp-src/.init-ok
+        EOF
+        chmod +x /custom-cont-init.d/01-install-mcp.sh
+        exec /init
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Europe/Bucharest
+      PRINTER_HOST: "${PRINTER_HOST:?set in Portainer environment}"
+      BAMBU_SERIAL: "${BAMBU_SERIAL:?set in Portainer environment}"
+      BAMBU_TOKEN: "${BAMBU_TOKEN:?set in Portainer environment}"
+      BAMBU_MODEL: x1c
+      BED_TYPE: textured_plate
+      NOZZLE_DIAMETER: "0.4"
+      TEMP_DIR: /tmp/bambu-mcp-temp
+      SLICER_TYPE: bambustudio
+      SLICER_PATH: /opt/bambustudio/bin/bambu-studio
+      BAMBU_CLI_FLATTEN: "true"
+      BAMBU_PROFILES_ROOT: /config/.config/BambuStudio/system
+      MCP_TRANSPORT: streamable-http
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "3003"
+      MCP_HTTP_PATH: /mcp
+      MCP_HTTP_STATEFUL: "true"
+      MCP_HTTP_JSON_RESPONSE: "true"
+      MCP_HTTP_ALLOWED_ORIGINS: "*"
+    volumes:
+      - /mnt/data/bambustudio/config:/config
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3003:3003"
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3003/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s

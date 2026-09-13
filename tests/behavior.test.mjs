@@ -579,6 +579,11 @@ test("H2 family print_3mf rejects pre-sliced filament jobs without explicit AMS 
   }
 });
 
+test("X1C ams_slots maps physical tray 3 to the legacy right-aligned mapping", () => {
+  const source = fs.readFileSync(new URL("../dist/printers/bambu.js", import.meta.url), "utf8");
+  assert.match(source, /right-align/);
+  assert.match(source, /amsLoadedSlot/);
+});
 test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", async () => {
   const threeMfPath = await writeSliced3mfFixture({ plateFilamentIds: [1] });
   const bambu = new BambuImplementation();

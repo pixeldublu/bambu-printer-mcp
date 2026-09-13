@@ -2013,6 +2013,7 @@ class BambuPrinterMCPServer {
                             type: "object",
                             properties: {
                                 three_mf_path: { type: "string", description: "Path to the 3MF file to print" },
+                                project_name: { type: "string", description: "Optional printer subtask name. Use a unique name to avoid printer-side job/file deduplication when resubmitting the same 3MF." },
                                 bambu_model: {
                                     type: "string",
                                     enum: [...VALID_BAMBU_MODELS],
@@ -2054,7 +2055,7 @@ class BambuPrinterMCPServer {
                                 },
                                 ams_slots: {
                                     type: "array",
-                                    description: "Preferred AMS input: one absolute tray index per USED filament in plate order, e.g. [1] for a single-filament print pulling from AMS 0 slot 1. Expanded to project-level ams_mapping automatically from the 3MF's plate_N.json and gcode header.",
+                                    description: "Preferred AMS input: one absolute tray index per USED filament in plate order. On X1/P1/A1, [2] selects physical third tray; do not use load_filament_ids for this.",
                                     items: { type: "number" }
                                 },
                                 auto_match_ams: {
@@ -2691,7 +2692,7 @@ class BambuPrinterMCPServer {
                             useAMS = false;
                         }
                         const threeMfFilename = path.basename(threeMFPath);
-                        const projectName = threeMfFilename.replace(/\.3mf$/i, '');
+                        const projectName = String(args?.project_name || threeMfFilename.replace(/\.3mf$/i, ''));
                         result = await this.bambu.print3mf(host, bambuSerial, bambuToken, {
                             projectName,
                             filePath: threeMFPath,
@@ -2707,7 +2708,6 @@ class BambuPrinterMCPServer {
                             layerInspect: args?.layer_inspect !== undefined ? Boolean(args.layer_inspect) : undefined,
                             timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : undefined,
                         });
-                        result = `Print command for ${threeMfFilename} sent successfully.`;
                         break;
                     }
                     case "print_collar_charm": {

@@ -13,11 +13,8 @@ interface BambuPrintOptionsInternal {
     amsMapping?: number[];
     /**
      * Per-used-filament absolute tray index, one entry per position in the
-     * selected plate's `filament_ids`. Example: plate uses project filament 1
-     * only, and you want to pull from AMS 0 tray 1 -> pass `[1]`. The server
-     * expands this into the project-level `ams_mapping` array at the right
-     * position automatically (H2-series). Preferred over `amsMapping` for
-     * ergonomic callers; `amsMapping` takes precedence if both are set.
+     * selected plate's `filament_ids`. On X1/P1/A1, `[2]` selects physical AMS
+     * tray 3. Never use `load_filament_ids` as a tray selector.
      */
     amsSlots?: number[];
     md5?: string;
@@ -26,6 +23,7 @@ export declare class BambuImplementation {
     private printerStore;
     constructor();
     private getPrinter;
+    private preloadAmsSlot;
     private resolveProjectFileMetadata;
     getStatus(host: string, serial: string, token: string): Promise<any>;
     print3mf(host: string, serial: string, token: string, options: BambuPrintOptionsInternal): Promise<any>;

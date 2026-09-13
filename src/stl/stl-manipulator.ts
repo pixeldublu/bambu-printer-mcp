@@ -1503,7 +1503,7 @@ export class STLManipulator extends EventEmitter {
           {
             const is3mf = stlFilePath.toLowerCase().endsWith('.3mf');
             const outputBase = path.basename(stlFilePath, is3mf ? '.3mf' : '.stl');
-            const bambuOutputPath = path.join(this.tempDir, outputBase + '_sliced.3mf');
+            const bambuOutputPath = path.join(this.tempDir, outputBase + '_sliced.gcode.3mf');
             const outputDir = path.dirname(bambuOutputPath);
             const rawBundle = this.resolveBambuLikeSettingsBundle(
               outputBase,

@@ -77,11 +77,8 @@ interface BambuPrintOptionsInternal {
   amsMapping?: number[];
   /**
    * Per-used-filament absolute tray index, one entry per position in the
-   * selected plate's `filament_ids`. Example: plate uses project filament 1
-   * only, and you want to pull from AMS 0 tray 1 -> pass `[1]`. The server
-   * expands this into the project-level `ams_mapping` array at the right
-   * position automatically (H2-series). Preferred over `amsMapping` for
-   * ergonomic callers; `amsMapping` takes precedence if both are set.
+   * selected plate's `filament_ids`. On X1/P1/A1, `[2]` selects physical AMS
+   * tray 3. Never use `load_filament_ids` as a tray selector.
    */
   amsSlots?: number[];
   md5?: string;
@@ -421,6 +418,67 @@ export class BambuImplementation {
     return this.printerStore.getPrinter(host, serial, token);
   }
 
+  private async preloadAmsSlot(
+    host: string,
+    serial: string,
+    token: string,
+    absoluteTray: number
+  ): Promise<number> {
+    if (!Number.isInteger(absoluteTray) || absoluteTray < 0 || absoluteTray > 15) {
+      throw new Error(`AMS tray must be an absolute tray index from 0 to 15; got ${absoluteTray}`);
+    }
+
+    const printer = await this.getPrinter(host, serial, token);
+    const amsId = Math.floor(absoluteTray / 4);
+    const slotId = absoluteTray % 4;
+
+    await printer.publish({
+      print: {
+        sequence_id: "0",
+        command: "ams_change_filament",
+        ams_id: amsId,
+        slot_id: slotId,
+        target: absoluteTray,
+        soft_temp: 0,
+        tar_temp: -1,
+        curr_temp: -1,
+      },
+    });
+
+    const deadline = Date.now() + 180_000;
+    let stableReadyCount = 0;
+    let lastState = "";
+
+    while (Date.now() < deadline) {
+      const report = this.printerStore.getCachedReport(host, serial, token) || {};
+      const rawAms = report.ams || {};
+      const trayNow = Number.parseInt(String(rawAms.tray_now ?? "-1"), 10);
+      const trayTarget = Number.parseInt(String(rawAms.tray_tar ?? "-1"), 10);
+      const rawAmsStatus = Number.parseInt(String(report.ams_status ?? "-1"), 10);
+      const mainStatus = rawAmsStatus >= 0 ? (rawAmsStatus >> 8) & 255 : -1;
+      const state = `tray_now=${trayNow} tray_tar=${trayTarget} ams_status=${rawAmsStatus}`;
+
+      if (state !== lastState) {
+        console.log(`[AMS] ${state}`);
+        lastState = state;
+      }
+
+      const statusReady = mainStatus < 0 || mainStatus !== 1;
+      if (trayNow === absoluteTray && trayTarget === absoluteTray && statusReady) {
+        stableReadyCount += 1;
+      } else {
+        stableReadyCount = 0;
+      }
+
+      if (stableReadyCount >= 5) {
+        return absoluteTray;
+      }
+      await sleep(1000);
+    }
+
+    throw new Error(`Timed out waiting for AMS tray ${absoluteTray} to finish loading and settle.`);
+  }
+
   private async resolveProjectFileMetadata(
     localThreeMfPath: string,
     plateIndex?: number
@@ -571,8 +629,9 @@ export class BambuImplementation {
     let remoteFileName = path.basename(options.filePath);
     remoteFileName = remoteFileName.replace(/\.gcode\.3mf\.gcode\.3mf$/i, ".gcode.3mf");
 
-    // H2-series printers land files at the FTP root and reference them via ftp:///<name>.
     // P1/A1/X1 use /cache/<name> and file:///sdcard/cache/<name>.
+    // Pre-sliced .gcode.3mf files use project_file so AMS mapping is carried
+    // in the same firmware command; gcode_file is for plain .gcode only.
     const isH2 =
       serial.startsWith("093") ||
       serial.startsWith("094") ||
@@ -584,30 +643,32 @@ export class BambuImplementation {
       : `file:///sdcard/${remoteProjectPath}`;
 
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
+    // and avoids TLS session-reuse failures seen with the printer's implicit FTPS.
     await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
-
-    // Pre-sliced .gcode.3mf files: routing depends on firmware generation.
-    // P1/A1/X1 series: project_file returns 405004002 for .gcode.3mf (firmware
-    // doesn't recognise the container), so use gcode_file instead.
-    // H2-series: gcode_file is not supported; project_file works because the
-    // firmware can open the zip and find Metadata/plate_<n>.gcode directly.
-    if (options.filePath.toLowerCase().endsWith(".gcode.3mf")) {
-      if (!isH2) {
-        const printer = await this.getPrinter(host, serial, token);
-        await invokeWithoutAck(printer, new GCodeFileCommand({ fileName: remoteProjectPath }));
-        return {
-          status: "success",
-          message: `Uploaded and started gcode.3mf print: ${options.projectName}`,
-          remoteProjectPath,
-        };
-      }
-      // H2-series: fall through to project_file path below
-    }
-
+    // Pre-sliced .gcode.3mf files use project_file on all supported models so
+    // the explicit AMS mapping is carried in the same firmware command. A
+    // plain .gcode file is handled by gcode_file elsewhere.
     const projectMetadata = await this.resolveProjectFileMetadata(
       options.filePath,
       options.plateIndex
     );
+
+    // Explicit single-filament selection is loaded and settled before
+    // project_file, so a successful result proves the physical AMS tray was
+    // accepted rather than merely appearing in an outgoing mapping.
+    let amsLoadedSlot: number | undefined;
+    if (
+      options.useAMS !== false &&
+      options.amsSlots &&
+      options.amsSlots.length > 0 &&
+      Boolean(options.bambuModel) &&
+      !isH2ModelName(options.bambuModel)
+    ) {
+      if (options.amsSlots.length !== 1) {
+        throw new Error("Explicit AMS preload supports exactly one requested tray.");
+      }
+      amsLoadedSlot = await this.preloadAmsSlot(host, serial, token, options.amsSlots[0]);
+    }
 
     // Send project_file command via bambu-node MQTT (bypasses bambu-js
     // hardcoded use_ams=true and missing ams_mapping support)
@@ -625,8 +686,9 @@ export class BambuImplementation {
     //
     // For H2-series the array length MUST equal the project-level filament
     // count declared by the slicer (parsed from the gcode header's
-    // `filament_colour` list). For P1/A1/X1 we pad to length 5 per the
-    // historical bambu-js behavior.
+    // `filament_colour` list). For P1/A1/X1, firmware expects a fixed five
+    // entries with used filament assignments right-aligned; however a raw
+    // `ams_mapping` override is preserved in project order.
     //
     // Caller ergonomics: callers typically know only "I want to pull this
     // print's filaments from these AMS slots" in the order the plate uses
@@ -648,9 +710,11 @@ export class BambuImplementation {
     };
 
     let baseMapping: number[];
+    let rawMappingProvided = false;
     if (options.amsMapping && options.amsMapping.length > 0) {
       for (const v of options.amsMapping) validateTrayValue(v, "ams_mapping");
       baseMapping = options.amsMapping.slice();
+      rawMappingProvided = true;
     } else if (options.amsSlots && options.amsSlots.length > 0) {
       for (const v of options.amsSlots) validateTrayValue(v, "amsSlots");
       const positions = projectMetadata.usedFilamentPositions;
@@ -699,70 +763,62 @@ export class BambuImplementation {
         return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
       });
     } else {
-      amsMapping = Array.from({ length: 5 }, (_, i) =>
-        i < baseMapping.length ? baseMapping[i] : -1
-      );
+      // X1/P1/A1 firmware uses a fixed five-entry mapping. Preserve a raw
+      // project-level mapping; right-align only the ergonomic used-filament
+      // list supplied through amsSlots.
+      if (rawMappingProvided) {
+        amsMapping = Array.from({ length: 5 }, (_, i) =>
+          i < baseMapping.length ? baseMapping[i] : -1
+        );
+      } else {
+        const usedMapping = projectMetadata.usedFilamentPositions.map(
+          (position) => baseMapping[position] ?? -1
+        );
+        amsMapping = Array<number>(5).fill(-1);
+        const rightOffset = Math.max(0, amsMapping.length - usedMapping.length);
+        usedMapping.forEach((value, index) => {
+          const targetIndex = rightOffset + index;
+          if (targetIndex < amsMapping.length) amsMapping[targetIndex] = value;
+        });
+      }
       amsMapping2 = [];
     }
 
     const b = (v: any) => (v ? 1 : 0);
-    let projectFileCmd: Record<string, any>;
-    if (isH2) {
-      const submissionId = String(Date.now() & 0x7fffffff);
-      projectFileCmd = {
-        print: {
-          sequence_id: "0",
-          command: "project_file",
-          param: `Metadata/${projectMetadata.plateFileName}`,
-          url: projectUrl,
-          file: remoteFileName,
-          md5,
-          bed_type: options.bedType || "auto",
-          timelapse: b(options.timelapse),
-          bed_leveling: b(options.bedLeveling ?? true),
-          auto_bed_leveling: 1,
-          flow_cali: b(options.flowCalibration ?? false),
-          vibration_cali: b(options.vibrationCalibration ?? true),
-          layer_inspect: b(options.layerInspect ?? false),
-          use_ams: options.useAMS !== false,
-          cfg: "0",
-          extrude_cali_flag: 0,
-          extrude_cali_manual_mode: 0,
-          nozzle_offset_cali: 2,
-          subtask_name: remoteFileName.replace(/\.3mf$/i, ""),
-          profile_id: "0",
-          project_id: submissionId,
-          subtask_id: submissionId,
-          task_id: submissionId,
-          ams_mapping: amsMapping,
-          ams_mapping2: amsMapping2,
-        },
-      };
-    } else {
-      projectFileCmd = {
-        print: {
-          command: "project_file",
-          param: `Metadata/${projectMetadata.plateFileName}`,
-          url: projectUrl,
-          subtask_name: options.projectName,
-          md5,
-          flow_cali: options.flowCalibration ?? true,
-          layer_inspect: options.layerInspect ?? true,
-          vibration_cali: options.vibrationCalibration ?? true,
-          bed_leveling: options.bedLeveling ?? true,
-          bed_type: options.bedType || "textured_plate",
-          timelapse: options.timelapse ?? false,
-          use_ams: options.useAMS !== false,
-          ams_mapping: amsMapping,
-          profile_id: "0",
-          project_id: "0",
-          sequence_id: "0",
-          subtask_id: "0",
-          task_id: "0",
-        },
-      };
-    }
+    const submissionId = String(Date.now() & 0x7fffffff);
+    const projectFileCmd: Record<string, any> = {
+      print: {
+        sequence_id: "0",
+        command: "project_file",
+        param: `Metadata/${projectMetadata.plateFileName}`,
+        url: projectUrl,
+        file: remoteFileName,
+        md5,
+        bed_type: options.bedType || "auto",
+        timelapse: b(options.timelapse),
+        bed_leveling: b(options.bedLeveling ?? true),
+        auto_bed_leveling: 1,
+        flow_cali: b(options.flowCalibration ?? false),
+        vibration_cali: b(options.vibrationCalibration ?? true),
+        layer_inspect: b(options.layerInspect ?? false),
+        use_ams: options.useAMS !== false,
+        cfg: "0",
+        extrude_cali_flag: 0,
+        extrude_cali_manual_mode: 0,
+        nozzle_offset_cali: 2,
+        subtask_name: options.projectName,
+        profile_id: "0",
+        project_id: submissionId,
+        subtask_id: submissionId,
+        task_id: submissionId,
+        ams_mapping: amsMapping,
+        ams_mapping2: amsMapping2,
+      },
+    };
 
+    // Post the project_file command, then wait briefly for the printer to
+    // publish its first status. The caller receives the actual command fields
+    // so deployment/debug logs can verify AMS mapping instead of guessing.
     await printer.publish(projectFileCmd);
     await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -774,6 +830,8 @@ export class BambuImplementation {
       platePath: projectMetadata.plateInternalPath,
       md5,
       amsMapping,
+      amsLoadedSlot,
+      command: projectFileCmd,
     };
   }
 
