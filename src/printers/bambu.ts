@@ -1751,10 +1751,12 @@ export class BambuImplementation {
       // 0 = IDLE, 1/3 = loading/unloading motion, 2 = unknown. See the
       // bambu-node / Bambu protocol notes.
       const amsMainStatus = rawAmsStatus >= 0 ? (rawAmsStatus >> 8) & 255 : -1;
-      // The X1C may retain 0x300 (busy/transition) in a cached report after
-      // a completed tray load. Once the requested tray and target agree, use
-      // a fresh push_status before deciding whether project_file is safe.
-      if (trayNow === absoluteTray && trayTarget === absoluteTray && amsMainStatus !== 1 && amsMainStatus !== 3) {
+      // Do not trust a cached AMS status after the explicit load command.
+      // tray_now == tray_tar is the printer's authoritative settled selection;
+      // firmware may keep the main status at 0x02/0x03 while idle at the
+      // hotend, which is not a mechanical load in progress.
+      const moving = amsMainStatus === 1 || amsMainStatus === 3;
+      if (trayNow === absoluteTray && trayTarget === absoluteTray && !moving) {
         stableReadyCount += 1;
         if (stableReadyCount >= stableChecks) {
           console.log(`[AMS] Filament load fully settled for tray ${absoluteTray}`);
