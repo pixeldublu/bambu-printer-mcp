@@ -761,9 +761,8 @@ export class BambuImplementation {
           ams_id: amsId,
           slot_id: slotId,
           target: absoluteTray,
-          soft_temp: 0,
-          tar_temp: -1,
-          curr_temp: -1,
+          curr_temp: 0,
+          tar_temp: 0,
         },
       });
       const settled = await this.waitForAmsTrayReady(printer, absoluteTray);
