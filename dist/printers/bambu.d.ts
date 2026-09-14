@@ -20,6 +20,17 @@ interface BambuPrintOptionsInternal {
      * ergonomic callers; `amsMapping` takes precedence if both are set.
      */
     amsSlots?: number[];
+    /**
+     * When true (default), the firmware is free to auto-match sliced filament
+     * profiles against physically loaded AMS trays. When false, the caller's
+     * `amsSlots` is treated as authoritative: the server pre-loads the
+     * requested tray via `ams_change_filament`, waits for it to settle, and
+     * omits `ams_mapping` from `project_file` so firmware cannot re-route.
+     * Set false when you know the requested material but the physical tray's
+     * `tray_info_idx` does not match the slicer profile (causing auto-match
+     * to either pick the wrong tray or reject the job).
+     */
+    autoMatchAms?: boolean;
     md5?: string;
 }
 export declare class BambuImplementation {
@@ -180,6 +191,13 @@ export declare class BambuImplementation {
      */
     private ftpUpload;
     private waitForTlsSession;
+    /**
+     * Wait until the AMS has physically loaded the requested tray AND the
+     * AMS main state is IDLE for several consecutive checks. Race-prone if we
+     * only wait for `tray_now` because firmware reports the requested tray
+     * while the mechanical load/unload is still in progress.
+     */
+    private waitForAmsTrayReady;
     disconnectAll(): Promise<void>;
 }
 export {};

@@ -463,6 +463,13 @@ export class BambuImplementation {
         const isH2 = serial.startsWith("093") ||
             serial.startsWith("094") ||
             isH2ModelName(options.bambuModel);
+        // X1/P1/A1 firmware rejects ".gcode.3mf" as the on-printer filename
+        // ("Unsupported file path or name"). The local sliced container keeps its
+        // real .gcode.3mf extension -- only the remote name is rewritten to .3mf
+        // so the firmware parses it as a project file rather than plain gcode.
+        if (!isH2) {
+            remoteFileName = remoteFileName.replace(/\.gcode\.3mf$/i, ".3mf");
+        }
         const remoteProjectPath = isH2 ? remoteFileName : `cache/${remoteFileName}`;
         const remoteUploadPath = isH2 ? `/${remoteFileName}` : `/cache/${remoteFileName}`;
         const projectUrl = isH2
@@ -578,6 +585,41 @@ export class BambuImplementation {
             amsMapping2 = [];
         }
         const b = (v) => (v ? 1 : 0);
+        // X1/P1/A1 path: explicitly command the requested AMS tray to load, wait
+        // for it to fully settle (tray_now = requested AND ams main = IDLE for
+        // several consecutive status checks), then send project_file. Without
+        // this, the firmware can accept project_file while the mechanical load
+        // is still in progress and immediately reject with "Failed to start a
+        // new task: Filament loading/unloading not completed". When
+        // auto_match_ams is false, omit ams_mapping from project_file so the
+        // firmware uses the manually-loaded tray rather than re-matching.
+        if (!isH2 &&
+            options.useAMS !== false &&
+            options.amsSlots &&
+            options.amsSlots.length > 0 &&
+            options.amsSlots[0] >= 0) {
+            const absoluteTray = options.amsSlots[0];
+            const amsId = Math.floor(absoluteTray / 4);
+            const slotId = absoluteTray % 4;
+            console.log(`[X1] Pre-loading filament from AMS ${amsId} slot ${slotId} (absolute tray ${absoluteTray})...`);
+            await printer.publish({
+                print: {
+                    sequence_id: "0",
+                    command: "ams_change_filament",
+                    ams_id: amsId,
+                    slot_id: slotId,
+                    target: absoluteTray,
+                    soft_temp: 0,
+                    tar_temp: -1,
+                    curr_temp: -1,
+                },
+            });
+            const settled = await this.waitForAmsTrayReady(printer, absoluteTray);
+            if (!settled) {
+                throw new Error(`AMS did not reach a stable idle state for tray ${absoluteTray} within timeout; aborting print start to avoid race with filament load.`);
+            }
+            console.log(`[X1] AMS ready; continuing to project_file`);
+        }
         let projectFileCmd;
         if (isH2) {
             const submissionId = String(Date.now() & 0x7fffffff);
@@ -626,7 +668,11 @@ export class BambuImplementation {
                     bed_type: options.bedType || "textured_plate",
                     timelapse: options.timelapse ?? false,
                     use_ams: options.useAMS !== false,
-                    ams_mapping: amsMapping,
+                    // When auto_match_ams is false we already commanded the AMS
+                    // tray to load above. Re-sending ams_mapping here would let
+                    // firmware auto-match and possibly pick a different tray than
+                    // the one we physically loaded.
+                    ...(options.autoMatchAms === false ? {} : { ams_mapping: amsMapping }),
                     profile_id: "0",
                     project_id: "0",
                     sequence_id: "0",
@@ -1319,6 +1365,41 @@ export class BambuImplementation {
         if (!socket.getSession()?.length) {
             throw new Error("FTPS control-channel TLS session ticket was not established; refusing data transfer because Bambu requires TLS session reuse.");
         }
+    }
+    /**
+     * Wait until the AMS has physically loaded the requested tray AND the
+     * AMS main state is IDLE for several consecutive checks. Race-prone if we
+     * only wait for `tray_now` because firmware reports the requested tray
+     * while the mechanical load/unload is still in progress.
+     */
+    async waitForAmsTrayReady(printer, absoluteTray, timeoutMs = 60000, stableChecks = 3) {
+        const deadline = Date.now() + timeoutMs;
+        let stableReadyCount = 0;
+        while (Date.now() < deadline) {
+            const data = printer.data ?? {};
+            const amsArr = data.ams?.ams ?? [];
+            const amsId = Math.floor(absoluteTray / 4);
+            const slotId = absoluteTray % 4;
+            const amsUnit = amsArr[amsId];
+            const trayNow = amsUnit?.tray?.[slotId]?.id;
+            // AMS main state lives in the upper byte of the 16-bit ams_status.
+            // 0 = IDLE, 1/3 = loading/unloading motion, 2 = unknown. See the
+            // bambu-node / Bambu protocol notes.
+            const rawAmsStatus = Number(amsUnit?.ams_status ?? 0);
+            const amsMainStatus = (rawAmsStatus >> 8) & 255;
+            if (Number(trayNow) === slotId && amsMainStatus === 0) {
+                stableReadyCount += 1;
+                if (stableReadyCount >= stableChecks) {
+                    console.log(`[AMS] Filament load fully settled for tray ${absoluteTray}`);
+                    return true;
+                }
+            }
+            else {
+                stableReadyCount = 0;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        return false;
     }
     async disconnectAll() {
         await this.printerStore.disconnectAll();

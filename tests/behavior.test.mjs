@@ -628,12 +628,28 @@ test("X1C ams_slots right-aligns a single filament in the legacy mapping", async
   });
   const bambu = new BambuImplementation();
   let publishedPayload = null;
-  bambu.ftpUpload = async () => {};
-  bambu.getPrinter = async () => ({
+  // AMS pre-load wait checks printer.data.ams.ams[0].tray[2].id == 2 and
+  // ams_status upper byte == 0. Simulate the printer reporting that tray
+  // 2 is loaded and the AMS main state is IDLE before publish() runs.
+  const fakePrinter = {
+    data: {
+      ams: {
+        ams: [
+          {
+            ams_status: 0,
+            tray: [
+              { id: 0 }, { id: 1 }, { id: 2 }, { id: 3 },
+            ],
+          },
+        ],
+      },
+    },
     publish: async (payload) => {
       publishedPayload = payload;
     },
-  });
+  };
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => fakePrinter;
 
   try {
     const result = await bambu.print3mf("127.0.0.1", "00X1CTEST000000", "TEST_TOKEN", {
