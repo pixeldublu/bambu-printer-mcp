@@ -579,11 +579,6 @@ test("H2 family print_3mf rejects pre-sliced filament jobs without explicit AMS 
   }
 });
 
-test("X1C ams_slots maps physical tray 3 to the legacy right-aligned mapping", () => {
-  const source = fs.readFileSync(new URL("../dist/printers/bambu.js", import.meta.url), "utf8");
-  assert.match(source, /right-align/);
-  assert.match(source, /amsLoadedSlot/);
-});
 test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", async () => {
   const threeMfPath = await writeSliced3mfFixture({ plateFilamentIds: [1] });
   const bambu = new BambuImplementation();
@@ -621,6 +616,40 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
       { ams_id: 255, slot_id: 255 },
       { ams_id: 255, slot_id: 255 },
     ]);
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("X1C ams_slots right-aligns a single filament in the legacy mapping", async () => {
+  const threeMfPath = await writeSliced3mfFixture({
+    name: "x1c-single-filament",
+    plateFilamentIds: [0],
+  });
+  const bambu = new BambuImplementation();
+  let publishedPayload = null;
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => ({
+    publish: async (payload) => {
+      publishedPayload = payload;
+    },
+  });
+
+  try {
+    const result = await bambu.print3mf("127.0.0.1", "00X1CTEST000000", "TEST_TOKEN", {
+      projectName: "x1c-cube",
+      filePath: threeMfPath,
+      bambuModel: "x1c",
+      plateIndex: 0,
+      useAMS: true,
+      amsSlots: [2],
+      bedType: "textured_plate",
+    });
+
+    assert.equal(result.status, "success");
+    assert.equal(publishedPayload?.print?.command, "project_file");
+    assert.deepEqual(publishedPayload.print.ams_mapping, [-1, -1, -1, -1, 2]);
+    assert.equal(publishedPayload.print.use_ams, true);
   } finally {
     fs.rmSync(threeMfPath, { force: true });
   }

@@ -634,6 +634,22 @@ function parseCsvEnv(value: string | undefined): Set<string> {
   return new Set(value.split(",").map((e) => e.trim()).filter((e) => e.length > 0));
 }
 
+async function readHttpJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > 2 * 1024 * 1024) {
+      throw new Error("MCP request body exceeds 2 MiB");
+    }
+    chunks.push(buffer);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return undefined;
+  return JSON.parse(raw);
+}
+
 async function resolveSlicerProfilePath(
   requestedProfile: string | undefined,
   templatePath: string | undefined,
@@ -1017,7 +1033,10 @@ class BambuPrinterMCPServer {
   private bambuNetwork: BambuNetworkBridge;
   private stlManipulator: STLManipulator;
   private readonly runtimeConfig: RuntimeConfig;
-  private httpRuntime?: { transport: StreamableHTTPServerTransport; httpServer: HttpServer };
+  private httpRuntime?: {
+    httpServer: HttpServer;
+    sessions: Map<string, { owner: BambuPrinterMCPServer; transport: StreamableHTTPServerTransport }>;
+  };
 
   constructor() {
     this.runtimeConfig = readRuntimeConfig();
@@ -2552,7 +2571,7 @@ class BambuPrinterMCPServer {
                 },
                 ams_slots: {
                   type: "array",
-                  description: "Preferred AMS input: one absolute tray index per USED filament in plate order. On X1/P1/A1, [2] selects physical third tray; do not use load_filament_ids for this.",
+                  description: "Preferred AMS input: one absolute tray index per USED filament in plate order. For X1/P1/A1 legacy mapping, a single-filament [2] is emitted as [-1,-1,-1,-1,2] so firmware selects AMS tray 3; the value is never an external-spool selector. Expanded from the 3MF's plate_N.json and gcode header.",
                   items: { type: "number" }
                 },
                 auto_match_ams: {
@@ -3385,6 +3404,7 @@ class BambuPrinterMCPServer {
               layerInspect: args?.layer_inspect !== undefined ? Boolean(args.layer_inspect) : undefined,
               timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : undefined,
             });
+            result = `Print command for ${threeMfFilename} sent successfully.`;
             break;
           }
 
@@ -3593,33 +3613,97 @@ class BambuPrinterMCPServer {
   async startHttp() {
     const { httpHost, httpPort, httpPath, statefulSession, enableJsonResponse, allowedOrigins } =
       this.runtimeConfig;
-
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: statefulSession ? () => randomUUID() : undefined,
-      enableJsonResponse,
-    });
-
-    await this.server.connect(transport);
+    const sessions = new Map<string, { owner: BambuPrinterMCPServer; transport: StreamableHTTPServerTransport }>();
+    const statelessEntry = !statefulSession
+      ? {
+          owner: this,
+          transport: new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse,
+          }),
+        }
+      : undefined;
+    if (statelessEntry) {
+      await this.server.connect(statelessEntry.transport);
+    }
 
     const httpServer = createHttpServer(
       async (req: IncomingMessage, res: ServerResponse) => {
-        const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-        if (url.pathname !== httpPath) {
-          res.writeHead(404);
-          res.end("Not found");
-          return;
-        }
-
-        if (allowedOrigins.size > 0) {
-          const origin = req.headers.origin ?? "";
-          if (origin && !allowedOrigins.has(origin)) {
-            res.writeHead(403);
-            res.end("Forbidden");
+        try {
+          const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+          if (url.pathname === "/healthz" && req.method === "GET") {
+            res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+            res.end("ok");
             return;
           }
-        }
+          if (url.pathname !== httpPath) {
+            res.writeHead(404);
+            res.end("Not found");
+            return;
+          }
 
-        await transport.handleRequest(req, res);
+          if (allowedOrigins.size > 0) {
+            const origin = req.headers.origin ?? "";
+            if (origin && !allowedOrigins.has(origin)) {
+              res.writeHead(403);
+              res.end("Forbidden");
+              return;
+            }
+          }
+
+          const requestedSessionId = req.headers["mcp-session-id"] as string | undefined;
+          let entry = requestedSessionId ? sessions.get(requestedSessionId) : undefined;
+
+          // A stateful Streamable HTTP transport is tied to exactly one MCP
+          // Server instance. Reusing one transport for several clients makes
+          // the SDK report "Server already initialized"; creating one per
+          // initialized session fixes concurrent clients and stale reconnects.
+          if (!entry && !statefulSession) {
+            entry = statelessEntry;
+          }
+          if (!entry) {
+            if (statefulSession && req.method !== "POST") {
+              res.writeHead(400);
+              res.end("Missing mcp-session-id");
+              return;
+            }
+            if (statefulSession && req.method === "POST") {
+              const body = await readHttpJsonBody(req);
+              const isInitialize = body && typeof body === "object" &&
+                (body as any).method === "initialize";
+              if (!isInitialize) {
+                res.writeHead(400);
+                res.end("Missing mcp-session-id");
+                return;
+              }
+
+              const owner = new BambuPrinterMCPServer();
+              const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                enableJsonResponse,
+              });
+              entry = { owner, transport };
+              transport.onclose = () => {
+                if (transport.sessionId) sessions.delete(transport.sessionId);
+              };
+              await owner.server.connect(transport);
+              await transport.handleRequest(req, res, body);
+              if (transport.sessionId) sessions.set(transport.sessionId, entry);
+              return;
+            }
+          }
+
+          if (!entry) {
+            res.writeHead(404);
+            res.end("Unknown mcp-session-id");
+            return;
+          }
+          await entry.transport.handleRequest(req, res);
+        } catch (error) {
+          console.error("[MCP HTTP Error]", error);
+          if (!res.headersSent) res.writeHead(500);
+          if (!res.writableEnded) res.end("Internal server error");
+        }
       }
     );
 
@@ -3627,7 +3711,7 @@ class BambuPrinterMCPServer {
       console.error(`Bambu Printer MCP server running on http://${httpHost}:${httpPort}${httpPath}`);
     });
 
-    this.httpRuntime = { transport, httpServer };
+    this.httpRuntime = { httpServer, sessions };
   }
 
   async run() {

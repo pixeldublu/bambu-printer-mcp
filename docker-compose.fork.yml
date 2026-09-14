@@ -18,12 +18,20 @@ services:
         #!/bin/bash
         set -euo pipefail
         while [ ! -f /opt/bambu-printer-mcp-src/.init-ok ]; do sleep 2; done
-        mkdir -p /config/.XDG
+        mkdir -p /config/.XDG /config/Desktop
+        # Transfer the STL into the container; no host bind mount is used.
+        if [ ! -s /config/Desktop/simple-hook-short.stl ]; then
+          curl -fL --retry 5 --retry-delay 2 http://172.25.0.2:8765/simple-hook-short.stl \
+            -o /config/Desktop/simple-hook-short.stl
+          test "$(stat -c '%s' /config/Desktop/simple-hook-short.stl)" = "65884"
+        fi
         exec s6-envdir /var/run/s6/container_environment \
           s6-setuidgid abc /usr/bin/env \
           LD_LIBRARY_PATH=/opt/bambustudio/bin:/opt/bambustudio/lib:/opt/bambustudio/usr/lib \
           XDG_RUNTIME_DIR=/config/.XDG \
           WAYLAND_DISPLAY=wayland-1 DISPLAY=:1 \
+          MCP_TRANSPORT=streamable-http MCP_HTTP_HOST=0.0.0.0 MCP_HTTP_PORT=3003 \
+          MCP_HTTP_PATH=/mcp MCP_HTTP_STATEFUL=true MCP_HTTP_JSON_RESPONSE=true \
           node /opt/bambu-printer-mcp-src/dist/index.js
         EOF
         chmod +x /custom-services.d/bambu-mcp
@@ -38,7 +46,7 @@ services:
         apt-get clean
         rm -rf /var/lib/apt/lists/*
         rm -rf /opt/bambu-printer-mcp-src
-        git clone https://github.com/pixeldublu/bambu-printer-mcp.git /opt/bambu-printer-mcp-src
+        git clone https://github.com/DMontgomery40/bambu-printer-mcp.git /opt/bambu-printer-mcp-src
         cd /opt/bambu-printer-mcp-src
         npm ci --no-audit --no-fund
         npm run build
@@ -74,7 +82,7 @@ services:
       MCP_HTTP_PATH: /mcp
       MCP_HTTP_STATEFUL: "true"
       MCP_HTTP_JSON_RESPONSE: "true"
-      MCP_HTTP_ALLOWED_ORIGINS: "*"
+      MCP_HTTP_ALLOWED_ORIGINS: ""
     volumes:
       - /mnt/data/bambustudio/config:/config
     ports:
