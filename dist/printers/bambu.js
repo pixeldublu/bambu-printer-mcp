@@ -684,6 +684,11 @@ export class BambuImplementation {
         }
         await printer.publish(projectFileCmd);
         await new Promise((resolve) => setTimeout(resolve, 300));
+        const postSubmit = printer.data ?? {};
+        const postState = String(postSubmit.gcode_state ?? "").toUpperCase();
+        if (postState === "FAILED") {
+            throw new Error(`Printer rejected project_file: gcode_state=FAILED, print_error=${postSubmit.print_error ?? 0}, hms=${JSON.stringify(postSubmit.hms ?? [])}`);
+        }
         return {
             status: "success",
             message: `Uploaded and started 3MF print: ${options.projectName}`,

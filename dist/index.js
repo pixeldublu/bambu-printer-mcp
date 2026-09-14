@@ -2731,7 +2731,7 @@ class BambuPrinterMCPServer {
                             layerInspect: args?.layer_inspect !== undefined ? Boolean(args.layer_inspect) : undefined,
                             timelapse: args?.timelapse !== undefined ? Boolean(args.timelapse) : undefined,
                         });
-                        result = `Print command for ${threeMfFilename} sent successfully.`;
+                        result = JSON.stringify(result);
                         break;
                     }
                     case "print_collar_charm": {
