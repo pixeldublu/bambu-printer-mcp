@@ -1741,17 +1741,17 @@ export class BambuImplementation {
     let stableReadyCount = 0;
     while (Date.now() < deadline) {
       const data = printer.data ?? {};
-      const amsArr = data.ams?.ams ?? [];
-      const amsId = Math.floor(absoluteTray / 4);
-      const slotId = absoluteTray % 4;
-      const amsUnit = amsArr[amsId];
-      const trayNow = amsUnit?.tray?.[slotId]?.id;
+      // The X1C's report puts these values in `print.ams`, while the AMS
+      // main state is a top-level `print.ams_status` field.
+      const rawAms = data.ams ?? {};
+      const trayNow = Number.parseInt(String(rawAms.tray_now ?? "-1"), 10);
+      const trayTarget = Number.parseInt(String(rawAms.tray_tar ?? "-1"), 10);
+      const rawAmsStatus = Number.parseInt(String(data.ams_status ?? "-1"), 10);
       // AMS main state lives in the upper byte of the 16-bit ams_status.
       // 0 = IDLE, 1/3 = loading/unloading motion, 2 = unknown. See the
       // bambu-node / Bambu protocol notes.
-      const rawAmsStatus = Number(amsUnit?.ams_status ?? 0);
-      const amsMainStatus = (rawAmsStatus >> 8) & 255;
-      if (Number(trayNow) === slotId && amsMainStatus === 0) {
+      const amsMainStatus = rawAmsStatus >= 0 ? (rawAmsStatus >> 8) & 255 : -1;
+      if (trayNow === absoluteTray && trayTarget === absoluteTray && amsMainStatus === 0) {
         stableReadyCount += 1;
         if (stableReadyCount >= stableChecks) {
           console.log(`[AMS] Filament load fully settled for tray ${absoluteTray}`);
