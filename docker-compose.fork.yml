@@ -46,7 +46,7 @@ services:
         apt-get clean
         rm -rf /var/lib/apt/lists/*
         rm -rf /opt/bambu-printer-mcp-src
-        git clone https://github.com/DMontgomery40/bambu-printer-mcp.git /opt/bambu-printer-mcp-src
+        git clone --branch main --single-branch https://github.com/pixeldublu/bambu-printer-mcp.git /opt/bambu-printer-mcp-src
         cd /opt/bambu-printer-mcp-src
         npm ci --no-audit --no-fund
         npm run build
