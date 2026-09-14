@@ -629,15 +629,16 @@ test("X1C ams_slots right-aligns a single filament in the legacy mapping", async
   const bambu = new BambuImplementation();
   let publishedPayload = null;
   // AMS pre-load fixture: values are under print.ams; ams_status is a
-  // top-level print field in the X1C report.
-  // Simulate the printer reporting that tray 2 is loaded and AMS is idle.
+  // top-level print field in the X1C report. A non-motion status is accepted
+  // because some X1C firmware reports 0x300 after the load has settled.
+  // Simulate the printer reporting that tray 2 is loaded and AMS is settled.
   const fakePrinter = {
     data: {
       ams: {
         tray_now: 2,
         tray_tar: 2,
       },
-      ams_status: 0,
+      ams_status: 0x200,
     },
     publish: async (payload) => {
       publishedPayload = payload;

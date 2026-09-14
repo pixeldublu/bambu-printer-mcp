@@ -1751,7 +1751,10 @@ export class BambuImplementation {
       // 0 = IDLE, 1/3 = loading/unloading motion, 2 = unknown. See the
       // bambu-node / Bambu protocol notes.
       const amsMainStatus = rawAmsStatus >= 0 ? (rawAmsStatus >> 8) & 255 : -1;
-      if (trayNow === absoluteTray && trayTarget === absoluteTray && amsMainStatus === 0) {
+      // The X1C may retain 0x300 (busy/transition) in a cached report after
+      // a completed tray load. Once the requested tray and target agree, use
+      // a fresh push_status before deciding whether project_file is safe.
+      if (trayNow === absoluteTray && trayTarget === absoluteTray && amsMainStatus !== 1 && amsMainStatus !== 3) {
         stableReadyCount += 1;
         if (stableReadyCount >= stableChecks) {
           console.log(`[AMS] Filament load fully settled for tray ${absoluteTray}`);
