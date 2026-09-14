@@ -807,6 +807,7 @@ export class BambuImplementation {
         },
       };
     } else {
+      const manualAmsSelection = options.autoMatchAms === false && options.amsSlots?.length;
       projectFileCmd = {
         print: {
           command: "project_file",
@@ -821,11 +822,11 @@ export class BambuImplementation {
           bed_type: options.bedType || "textured_plate",
           timelapse: options.timelapse ?? false,
           use_ams: options.useAMS !== false,
-          // When auto_match_ams is false we already commanded the AMS
-          // tray to load above. Re-sending ams_mapping here would let
-          // firmware auto-match and possibly pick a different tray than
-          // the one we physically loaded.
-          ...(options.autoMatchAms === false ? {} : { ams_mapping: amsMapping }),
+          // For manual tray selection the explicit preload is authoritative.
+          // Keep the sliced mapping out of the X1 command, but do include the
+          // selected absolute tray as the legacy five-entry mapping expected
+          // by X1 firmware.
+          ...(manualAmsSelection ? { ams_mapping: [-1, -1, -1, -1, options.amsSlots![0]] } : { ams_mapping: amsMapping }),
           profile_id: "0",
           project_id: "0",
           sequence_id: "0",
