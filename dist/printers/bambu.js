@@ -1302,15 +1302,23 @@ export class BambuImplementation {
         const socket = ftpClient.ftp?.socket;
         if (!socket || typeof socket.getSession !== "function")
             return;
-        if (socket.getSession())
+        // Node's TLS 1.3 session ticket is emitted as "session" (not
+        // "secureConnect") after the control channel is ready. basic-ftp passes
+        // getSession() into the passive data-channel TLS handshake; if we start
+        // before the ticket exists, Bambu returns 522 session reuse required.
+        if (socket.getSession()?.length)
             return;
         await new Promise((resolve) => {
-            const timeout = setTimeout(resolve, 1000);
-            socket.once("session", () => {
+            const timeout = setTimeout(resolve, 5000);
+            const onSession = () => {
                 clearTimeout(timeout);
                 resolve();
-            });
+            };
+            socket.once("session", onSession);
         });
+        if (!socket.getSession()?.length) {
+            throw new Error("FTPS control-channel TLS session ticket was not established; refusing data transfer because Bambu requires TLS session reuse.");
+        }
     }
     async disconnectAll() {
         await this.printerStore.disconnectAll();
