@@ -91,6 +91,18 @@ test("print3mf rejects sliced plates with no extrusion before upload", async () 
   }
 });
 
+test("print3mf rejects old include-blind startup before upload", async (t) => {
+  const file = await writeSliced3mfFixture();
+  t.after(() => fs.rmSync(file, {force: true}));
+  const zip = await JSZip.loadAsync(fs.readFileSync(file));
+  const old = await zip.file("Metadata/plate_1.gcode").async("string");
+  zip.file("Metadata/plate_1.gcode", "M970 Q1 A10 B10 C130 K0\nM109 S205\n" + old + "\nT255\n");
+  fs.writeFileSync(file, await zip.generateAsync({type: "nodebuffer"}));
+  const bambu = new BambuImplementation();
+  bambu.ftpUpload = async () => assert.fail("must reject before upload");
+  await assert.rejects(bambu.print3mf("127.0.0.1", "00X1CTEST000000", "TEST_TOKEN", {projectName: "old", filePath: file, bambuModel: "x1c", plateIndex: 0}), /generic startup without filament selection/);
+});
+
 test("injectPlateThumbnailsIfMissing adds standard Bambu plate previews", async (t) => {
   const threeMfPath = await writeSliced3mfFixture({ name: "thumbnail-injection" });
   t.after(() => fs.rmSync(threeMfPath, { force: true }));

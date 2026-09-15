@@ -37,6 +37,55 @@ function shQuote(value) {
 
 /* --- Tests --------------------------------------------------------------- */
 
+test("real upstream X1 include tree preserves complete manufacturer G-code for PLA and ABS", async (t) => {
+  const {root, bbl} = await makeSyntheticTree();
+  t.after(() => fs.rm(root, {recursive: true, force: true}));
+  await fs.cp(path.join(FIXTURES, "x1-includes", "BBL", "machine"), path.join(bbl, "machine"), {recursive: true});
+  await writeProfile(bbl, "process", {name: "process"});
+  for (const material of ["PLA", "ABS"]) {
+    await writeProfile(bbl, "filament", {name: material, filament_type: [material]});
+    const result = await flattenForCli({machineLeaf: "Bambu Lab X1 Carbon 0.4 nozzle", processLeaf: "process", filamentLeaves: [material], profilesRoot: root, tempDir: path.join(root, material)});
+    const flat = JSON.parse(await fs.readFile(result.machinePath, "utf8"));
+    for (const filename of ["2.json", "3.json", "4.json", "5.json", "6.json"]) {
+      const fragment = JSON.parse(await fs.readFile(path.join(bbl, "machine", filename), "utf8"));
+      for (const [key, value] of Object.entries(fragment)) {
+        if (key.endsWith("_gcode")) assert.equal(flat[key], value, key);
+      }
+    }
+    assert.match(flat.machine_start_gcode, /M620 S\[initial_no_support_extruder\]A/);
+    assert.match(flat.machine_start_gcode, /g29_before_print_flag/);
+    assert.match(flat.machine_start_gcode, /extrude_cali_flag/);
+    assert.doesNotMatch(flat.machine_start_gcode, /M109 S205/);
+    assert.equal(JSON.parse(await fs.readFile(result.filamentPaths[0], "utf8")).filament_type[0], material);
+  }
+});
+
+test("X1 includes replace generic startup, preserve identity, and fail closed", async (t) => {
+  const {root, bbl} = await makeSyntheticTree();
+  t.after(() => fs.rm(root, {recursive: true, force: true}));
+  const machineLeaf = "Bambu Lab X1 Carbon 0.4 nozzle";
+  const options = {machineLeaf, processLeaf: "process", filamentLeaves: ["ABS"], profilesRoot: root, tempDir: path.join(root, "out")};
+  await writeProfile(bbl, "process", {name: "process"});
+  await writeProfile(bbl, "filament", {name: "ABS", filament_type: ["ABS"]});
+  await writeProfile(bbl, "machine", {name: "generic", machine_start_gcode: "M109 S205"});
+  const start = "M620 M\nM620 S[initial_no_support_extruder]A\nT[initial_no_support_extruder]\nM621 S[initial_no_support_extruder]A\nM109 S[nozzle_temperature_initial_layer]";
+  await writeProfile(bbl, "machine", {name: "start", machine_start_gcode: start});
+  await writeProfile(bbl, "machine", {name: "nested", include: ["start"], machine_end_gcode: "T255"});
+  await writeProfile(bbl, "machine", {name: machineLeaf, inherits: "generic", include: ["nested"]});
+  const result = await flattenForCli(options);
+  const flat = JSON.parse(await fs.readFile(result.machinePath, "utf8"));
+  assert.equal(flat.machine_start_gcode, start);
+  assert.equal(flat.machine_end_gcode, "T255");
+  assert.equal(flat.name, machineLeaf);
+  assert.equal(flat.include, undefined);
+  await writeProfile(bbl, "machine", {name: "start", include: ["nested"]});
+  await assert.rejects(flattenForCli(options), /cycle/);
+  await fs.unlink(path.join(bbl, "machine", "start.json"));
+  await assert.rejects(flattenForCli(options), /not found/);
+  await writeProfile(bbl, "machine", {name: machineLeaf, inherits: "generic"});
+  await assert.rejects(flattenForCli(options), /Incomplete X1 machine startup/);
+});
+
 test("flattenForCli rejects non-BBL vendor explicitly", async () => {
   const { root } = await makeSyntheticTree();
   await assert.rejects(

@@ -146,7 +146,10 @@ async function buildNameIndex(
  *   - Unknown name (broken `inherits` reference).
  *   - Cycles (A -> B -> A).
  */
-function flattenByName(leafName: string, index: NameIndex): Record<string, unknown> {
+function flattenByName(leafName: string, index: NameIndex, active: string[] = []): Record<string, unknown> {
+  if (active.includes(leafName)) {
+    throw new Error(`Profile inheritance cycle / include cycle: ${[...active, leafName].join(" -> ")}`);
+  }
   const chain: Record<string, unknown>[] = [];
   const visited = new Set<string>();
   let cursor: string | undefined = leafName;
@@ -168,7 +171,25 @@ function flattenByName(leafName: string, index: NameIndex): Record<string, unkno
       );
     }
 
-    chain.push(entry.data);
+    // Includes are local profile fragments, not inheritance parents. Expand
+    // before merging the inheritance chain so a child's templates override
+    // generic parent G-code without replacing the child's identity.
+    const expanded: Record<string, unknown> = {};
+    const includes = entry.data.include;
+    if (includes !== undefined && (!Array.isArray(includes) || includes.some(n => typeof n !== "string" || !n))) {
+      throw new Error(`Invalid include list in profile "${cursor}"`);
+    }
+    for (const name of (includes ?? []) as string[]) {
+      const fragment = flattenByName(name, index, [...active, ...visited]);
+      for (const [key, value] of Object.entries(fragment)) {
+        if (!["name", "inherits", "include", "instantiation", "type", "from", "setting_id"].includes(key)) {
+          expanded[key] = value;
+        }
+      }
+    }
+    Object.assign(expanded, entry.data);
+    delete expanded.include;
+    chain.push(expanded);
     const parent = entry.data["inherits"];
     cursor = typeof parent === "string" && parent.length > 0 ? parent : undefined;
   }
@@ -473,6 +494,14 @@ export async function flattenForCli(opts: FlattenOptions): Promise<FlattenedProf
 
   // Flatten each leaf.
   const machineFlat = flattenByName(opts.machineLeaf, index);
+  // Reject the known generic fallback for X1 rather than producing another
+  // motion-only job. Do not invent or inject hardware G-code here.
+  if (/^Bambu Lab X1(?: Carbon|E)?\b/.test(opts.machineLeaf)) {
+    const start = String(machineFlat.machine_start_gcode ?? "");
+    if (!/^\s*M620\s+S(?:\[|\{)/m.test(start) || !/^\s*T(?:\[|\{)/m.test(start)) {
+      throw new Error("Incomplete X1 machine startup: missing parameterized AMS/tool selection. Check the installed profile include templates; refusing generic startup G-code.");
+    }
+  }
   const processFlat = flattenByName(opts.processLeaf, index);
   const filamentFlats = opts.filamentLeaves.map((n) => flattenByName(n, index));
 

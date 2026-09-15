@@ -31,7 +31,6 @@ function loadClientCreds() {
 }
 const CLIENT_CREDS = loadClientCreds();
 const COMMAND_SETTLE_MS = 300;
-const MIN_PRINTABLE_EXTRUSION_MOVES = 10;
 const MODEL_ID_TO_NAME = {
     O1C: "H2C",
     O1C2: "H2C",
@@ -356,10 +355,18 @@ export class BambuImplementation {
         const gcodeBuffer = await selectedEntry.async("nodebuffer");
         const md5 = createHash("md5").update(gcodeBuffer).digest("hex");
         const gcodeText = gcodeBuffer.toString("utf8");
+        // Refuse old archives produced by the include-blind flattener, even if
+        // the user resubmits them after upgrading. This is a known bad startup
+        // signature, not a general temperature rule (PLA may legitimately use 205).
+        if (/M970 Q1 A10 B10 C130 K0/.test(gcodeText) &&
+            /M109 S205/.test(gcodeText) &&
+            !/^\s*T(?:0|[1-9]\d?)\s*(?:;.*)?$/m.test(gcodeText)) {
+            throw new Error("Archive contains the generic startup without filament selection. Re-slice with resolved machine include templates; refusing upload.");
+        }
         const extrusionMoveCount = (gcodeText.match(/^\s*G[0-3]\b[^\r\n]*\bE-?\d/igm) ?? []).length;
-        if (extrusionMoveCount < MIN_PRINTABLE_EXTRUSION_MOVES) {
+        if (extrusionMoveCount === 0) {
             throw new Error(`${selectedEntry.name} contains only ${extrusionMoveCount} G0-G3 extrusion moves; ` +
-                `the slice appears to contain startup purge/retract commands but no model toolpath. ` +
+                `no extrusion commands were found. ` +
                 `Refusing to upload a non-printing sliced archive.`);
         }
         // Project filament count: parse the gcode header line
