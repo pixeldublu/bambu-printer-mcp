@@ -40,6 +40,7 @@ function loadClientCreds(): { cert: Buffer; key: Buffer } | null {
 const CLIENT_CREDS = loadClientCreds();
 
 const COMMAND_SETTLE_MS = 300;
+const MIN_PRINTABLE_EXTRUSION_MOVES = 10;
 
 const MODEL_ID_TO_NAME: Record<string, string> = {
   O1C: "H2C",
@@ -91,6 +92,8 @@ interface ProjectFileMetadata {
   plateFileName: string;
   plateInternalPath: string;
   md5: string;
+  gcodeBytes: number;
+  extrusionMoveCount: number;
   /** Number of filament slots declared at project level (length the H2
    * firmware expects for `ams_mapping`). Parsed from the gcode header
    * `; filament_colour = ...` list. */
@@ -458,6 +461,17 @@ export class BambuImplementation {
 
     const gcodeBuffer = await selectedEntry.async("nodebuffer");
     const md5 = createHash("md5").update(gcodeBuffer).digest("hex");
+    const gcodeText = gcodeBuffer.toString("utf8");
+    const extrusionMoveCount = (
+      gcodeText.match(/^\s*G[0-3]\b[^\r\n]*\bE-?\d/igm) ?? []
+    ).length;
+    if (extrusionMoveCount < MIN_PRINTABLE_EXTRUSION_MOVES) {
+      throw new Error(
+        `${selectedEntry.name} contains only ${extrusionMoveCount} G0-G3 extrusion moves; ` +
+        `the slice appears to contain startup purge/retract commands but no model toolpath. ` +
+        `Refusing to upload a non-printing sliced archive.`
+      );
+    }
 
     // Project filament count: parse the gcode header line
     // `; filament_colour = #FFFFFF;#FF911A80;#DCF478;#DCF478`
@@ -502,6 +516,8 @@ export class BambuImplementation {
       plateFileName: path.posix.basename(selectedEntry.name),
       plateInternalPath: selectedEntry.name,
       md5,
+      gcodeBytes: gcodeBuffer.length,
+      extrusionMoveCount,
       projectFilamentCount,
       usedFilamentPositions,
     };
@@ -586,9 +602,6 @@ export class BambuImplementation {
     // project (with preview/metadata) instead of presenting it as custom G-code.
     const projectUrl = `ftp:///${remoteProjectPath}`;
 
-    // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
-    await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
-
     // Pre-sliced .gcode.3mf files use project_file on X1/P1/A1/H2 so the
     // explicit AMS mapping is carried in the same firmware command. A plain
     // .gcode file is handled by gcode_file elsewhere.
@@ -596,6 +609,16 @@ export class BambuImplementation {
       options.filePath,
       options.plateIndex
     );
+
+    // Validate before upload. A printer can execute a plate with no extrusion
+    // moves, count every layer, and report FINISH without producing an object.
+    console.log(
+      `[project-file] validated ${projectMetadata.plateInternalPath}: ` +
+      `${projectMetadata.gcodeBytes} bytes, ${projectMetadata.extrusionMoveCount} extrusion moves`
+    );
+
+    // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
+    await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
 
     // Send project_file command via bambu-node MQTT (bypasses bambu-js
     // hardcoded use_ams=true and missing ams_mapping support)
@@ -613,9 +636,8 @@ export class BambuImplementation {
     //
     // For H2-series the array length MUST equal the project-level filament
     // count declared by the slicer (parsed from the gcode header's
-    // `filament_colour` list). For P1/A1/X1, firmware expects a fixed five
-    // entries with used filament assignments right-aligned; however a raw
-    // `ams_mapping` override is preserved in project order.
+    // `filament_colour` list). P1/A1/X1 use the same project positions and
+    // accept a legacy five-entry array padded with -1 on the right.
     //
     // Caller ergonomics: callers typically know only "I want to pull this
     // print's filaments from these AMS slots" in the order the plate uses
@@ -637,11 +659,9 @@ export class BambuImplementation {
     };
 
     let baseMapping: number[];
-    let rawMappingProvided = false;
     if (options.amsMapping && options.amsMapping.length > 0) {
       for (const v of options.amsMapping) validateTrayValue(v, "ams_mapping");
       baseMapping = options.amsMapping.slice();
-      rawMappingProvided = true;
     } else if (options.amsSlots && options.amsSlots.length > 0) {
       for (const v of options.amsSlots) validateTrayValue(v, "amsSlots");
       const positions = projectMetadata.usedFilamentPositions;
@@ -690,29 +710,18 @@ export class BambuImplementation {
         return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
       });
     } else {
-      // X1/P1/A1 firmware uses a fixed five-entry mapping. `amsMapping`
-      // is already a raw project-level array, so preserve it exactly; only
-      // ergonomic `amsSlots`/automatic mappings need right alignment.
-      if (rawMappingProvided) {
-        amsMapping = Array.from({ length: 5 }, (_, i) =>
-          i < baseMapping.length ? baseMapping[i] : -1
-        );
-      } else {
-        // Legacy X1/P1/A1 firmware right-aligns the USED filament list,
-        // not the sparse project-level array. A single filament from
-        // absolute tray 2 is [-1,-1,-1,-1,2], even when the project declares
-        // several unused filament profiles before/after it.
-        const usedMapping = projectMetadata.usedFilamentPositions.map(
-          (position) => baseMapping[position] ?? -1
-        );
-        amsMapping = Array<number>(5).fill(-1);
-        const rightOffset = Math.max(0, amsMapping.length - usedMapping.length);
-        usedMapping.forEach((value, index) => {
-          const targetIndex = rightOffset + index;
-          if (targetIndex < amsMapping.length) amsMapping[targetIndex] = value;
-        });
-      }
-      amsMapping2 = [];
+      // X1/P1/A1 map project filament position N at array index N and pad
+      // legacy unused positions on the right. Right-aligning a one-colour job
+      // maps filament position zero to "unresolved", allowing an empty print.
+      amsMapping = Array.from({ length: 5 }, (_, i) =>
+        i < baseMapping.length ? baseMapping[i] : -1
+      );
+      amsMapping2 = amsMapping.map((v) => {
+        if (v < 0 || v === 255) return { ams_id: 255, slot_id: 255 };
+        if (v === 254) return { ams_id: 255, slot_id: 0 };
+        if (v >= 128) return { ams_id: v, slot_id: 0 };
+        return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
+      });
     }
 
     const b = (v: any) => (v ? 1 : 0);
@@ -767,6 +776,7 @@ export class BambuImplementation {
           timelapse: options.timelapse ?? false,
           use_ams: options.useAMS !== false,
           ams_mapping: amsMapping,
+          ams_mapping2: amsMapping2,
           profile_id: "0",
           project_id: submissionId,
           sequence_id: submissionId,
@@ -787,6 +797,12 @@ export class BambuImplementation {
       );
     }
 
+    console.log(
+      `[project-file] accepted: file=${remoteFileName}, plate=${projectMetadata.plateFileName}, ` +
+      `use_ams=${options.useAMS !== false}, ams_mapping=${JSON.stringify(amsMapping)}, ` +
+      `ams_mapping2=${JSON.stringify(amsMapping2)}`
+    );
+
     return {
       status: "success",
       message: `Uploaded and started 3MF print: ${options.projectName}`,
@@ -797,6 +813,9 @@ export class BambuImplementation {
       platePath: projectMetadata.plateInternalPath,
       md5,
       amsMapping,
+      amsMapping2,
+      gcodeBytes: projectMetadata.gcodeBytes,
+      extrusionMoveCount: projectMetadata.extrusionMoveCount,
     };
   }
 

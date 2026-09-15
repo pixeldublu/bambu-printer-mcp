@@ -33,13 +33,16 @@ async function writeSliced3mfFixture({
   projectFilamentColors = ["#FFFFFF", "#FF911A80", "#DCF478", "#DCF478"],
   projectFilamentTypes = ["PETG", "PETG", "PLA", "PLA"],
   plateFilamentIds = [1],
+  includeExtrusion = true,
 } = {}) {
   const zip = new JSZip();
   const gcode = [
     `; filament_ids = ${projectFilamentIds.join(";")}`,
     `; filament_colour = ${projectFilamentColors.join(";")}`,
     `; filament_type = ${projectFilamentTypes.join(";")}`,
-    "G1 X0 Y0",
+    ...(includeExtrusion
+      ? Array.from({ length: 12 }, (_, index) => `G1 X${index} Y${index} E0.1`)
+      : ["G1 X0 Y0"]),
     "",
   ].join("\n");
   const md5 = createHash("md5").update(Buffer.from(gcode)).digest("hex");
@@ -61,6 +64,31 @@ async function writeSliced3mfFixture({
   fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
   return tempPath;
 }
+
+test("print3mf rejects sliced plates with no extrusion before upload", async () => {
+  const threeMfPath = await writeSliced3mfFixture({
+    name: "no-extrusion",
+    includeExtrusion: false,
+  });
+  const bambu = new BambuImplementation();
+  let uploaded = false;
+  bambu.ftpUpload = async () => { uploaded = true; };
+
+  try {
+    await assert.rejects(
+      bambu.print3mf("127.0.0.1", "00X1CTEST000000", "TEST_TOKEN", {
+        projectName: "empty",
+        filePath: threeMfPath,
+        bambuModel: "x1c",
+        plateIndex: 0,
+      }),
+      /contains only 0 G0-G3 extrusion moves/i
+    );
+    assert.equal(uploaded, false);
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
 
 test("injectPlateThumbnailsIfMissing adds standard Bambu plate previews", async (t) => {
   const threeMfPath = await writeSliced3mfFixture({ name: "thumbnail-injection" });
@@ -644,7 +672,7 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
   }
 });
 
-test("X1C ams_slots right-aligns a single filament in the legacy mapping", async () => {
+test("X1C ams_slots maps filament position zero and pads legacy entries on the right", async () => {
   const threeMfPath = await writeSliced3mfFixture({
     name: "x1c-single-filament",
     plateFilamentIds: [0],
@@ -687,7 +715,15 @@ test("X1C ams_slots right-aligns a single filament in the legacy mapping", async
     assert.equal(publishedPayloads.length, 1, "print start must not issue a separate AMS load command");
     const publishedPayload = publishedPayloads[0];
     assert.equal(publishedPayload?.print?.command, "project_file");
-    assert.deepEqual(publishedPayload.print.ams_mapping, [-1, -1, -1, -1, 2]);
+    assert.deepEqual(publishedPayload.print.ams_mapping, [2, -1, -1, -1, -1]);
+    assert.deepEqual(publishedPayload.print.ams_mapping2, [
+      { ams_id: 0, slot_id: 2 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+      { ams_id: 255, slot_id: 255 },
+    ]);
+    assert.equal(result.extrusionMoveCount, 12);
     assert.equal(publishedPayload.print.use_ams, true);
     assert.match(uploadedPath, /^\/cache\/x1c-single-filament-.+\.gcode\.3mf$/);
     assert.equal(publishedPayload.print.url, `ftp://${uploadedPath}`);
