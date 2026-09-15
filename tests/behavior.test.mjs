@@ -18,6 +18,7 @@ import { hasAmsMappingInput, normalizeAmsMappingObject } from "../dist/ams-mappi
 import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF } from "../dist/3mf_parser.js";
 import { BambuImplementation } from "../dist/printers/bambu.js";
 import { STLManipulator } from "../dist/stl/stl-manipulator.js";
+import { injectPlateThumbnailsIfMissing } from "../dist/slicer/plate-thumbnail.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,6 +61,27 @@ async function writeSliced3mfFixture({
   fs.writeFileSync(tempPath, await zip.generateAsync({ type: "nodebuffer" }));
   return tempPath;
 }
+
+test("injectPlateThumbnailsIfMissing adds standard Bambu plate previews", async (t) => {
+  const threeMfPath = await writeSliced3mfFixture({ name: "thumbnail-injection" });
+  t.after(() => fs.rmSync(threeMfPath, { force: true }));
+
+  const result = await injectPlateThumbnailsIfMissing(threeMfPath, SAMPLE_STL);
+  assert.deepEqual(result, { injected: true, plateIds: [1] });
+
+  const zip = await JSZip.loadAsync(fs.readFileSync(threeMfPath));
+  const large = await zip.file("Metadata/plate_1.png").async("nodebuffer");
+  const small = await zip.file("Metadata/plate_1_small.png").async("nodebuffer");
+  assert.deepEqual([...large.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(large.readUInt32BE(16), 512);
+  assert.equal(large.readUInt32BE(20), 512);
+  assert.equal(small.readUInt32BE(16), 128);
+  assert.equal(small.readUInt32BE(20), 128);
+
+  const secondResult = await injectPlateThumbnailsIfMissing(threeMfPath, SAMPLE_STL);
+  assert.equal(secondResult.injected, false);
+  assert.deepEqual(secondResult.plateIds, []);
+});
 
 function createClient() {
   return new Client({

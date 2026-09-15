@@ -10,6 +10,7 @@ import { EventEmitter } from 'events';
 import * as crypto from 'crypto';
 import { execFile } from 'child_process';
 import { flattenForCli, detectProfilesRoot } from '../slicer/profile-flatten.js';
+import { injectPlateThumbnailsIfMissing } from '../slicer/plate-thumbnail.js';
 
 const readFileAsync = promisify(fs.readFile);
 const writeFileAsync = promisify(fs.writeFile);
@@ -1610,6 +1611,17 @@ export class STLManipulator extends EventEmitter {
       
       if (!fs.existsSync(outputFilePath)) {
           throw new Error(`Slicer finished but output file not found: ${outputFilePath}`);
+      }
+
+      if (isBambuCompatibleSlicer(slicerType)) {
+        const thumbnailResult = await injectPlateThumbnailsIfMissing(outputFilePath, stlFilePath);
+        if (thumbnailResult.injected) {
+          console.log(
+            `[plate-thumbnail] injected preview for plate(s): ${thumbnailResult.plateIds.join(', ')}`
+          );
+        } else if (thumbnailResult.plateIds.length > 0) {
+          console.warn(`[plate-thumbnail] preview not injected: ${thumbnailResult.reason}`);
+        }
       }
 
       if (progressCallback) progressCallback(100, "Slicing completed successfully");
