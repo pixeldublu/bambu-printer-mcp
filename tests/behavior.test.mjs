@@ -730,9 +730,12 @@ test("H2 ams_slots expand into project-level ams_mapping and ams_mapping2", asyn
   }
 });
 
-test("X1C ams_slots maps filament position zero and pads legacy entries on the right", async () => {
+test("X1C one-filament project maps A3 without fixed-width padding", async () => {
   const threeMfPath = await writeSliced3mfFixture({
     name: "x1c-single-filament",
+    projectFilamentIds: ["GFL03"],
+    projectFilamentColors: ["#00FF00"],
+    projectFilamentTypes: ["ABS"],
     plateFilamentIds: [0],
   });
   const bambu = new BambuImplementation();
@@ -773,13 +776,9 @@ test("X1C ams_slots maps filament position zero and pads legacy entries on the r
     assert.equal(publishedPayloads.length, 1, "print start must not issue a separate AMS load command");
     const publishedPayload = publishedPayloads[0];
     assert.equal(publishedPayload?.print?.command, "project_file");
-    assert.deepEqual(publishedPayload.print.ams_mapping, [2, -1, -1, -1, -1]);
+    assert.deepEqual(publishedPayload.print.ams_mapping, [2]);
     assert.deepEqual(publishedPayload.print.ams_mapping2, [
       { ams_id: 0, slot_id: 2 },
-      { ams_id: 255, slot_id: 255 },
-      { ams_id: 255, slot_id: 255 },
-      { ams_id: 255, slot_id: 255 },
-      { ams_id: 255, slot_id: 255 },
     ]);
     assert.equal(result.extrusionMoveCount, 12);
     assert.equal(publishedPayload.print.use_ams, true);

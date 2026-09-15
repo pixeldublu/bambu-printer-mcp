@@ -634,10 +634,11 @@ export class BambuImplementation {
     // whenever the 3MF declares filaments, and a missing/invalid mapping
     // fails with 0700-8012-032015 "Failed to get AMS mapping table".
     //
-    // For H2-series the array length MUST equal the project-level filament
-    // count declared by the slicer (parsed from the gcode header's
-    // `filament_colour` list). P1/A1/X1 use the same project positions and
-    // accept a legacy five-entry array padded with -1 on the right.
+    // The array length MUST equal the project-level filament count declared
+    // by the slicer (parsed from the gcode header's `filament_colour` list).
+    // BambuStudio constructs both mapping arrays by iterating the project's
+    // filament preset list; padding X1/P1/A1 jobs to a fixed width makes the
+    // mapping invalid and can let a job run without loading its filament.
     //
     // Caller ergonomics: callers typically know only "I want to pull this
     // print's filaments from these AMS slots" in the order the plate uses
@@ -710,10 +711,11 @@ export class BambuImplementation {
         return { ams_id: Math.floor(v / 4), slot_id: v % 4 };
       });
     } else {
-      // X1/P1/A1 map project filament position N at array index N and pad
-      // legacy unused positions on the right. Right-aligning a one-colour job
-      // maps filament position zero to "unresolved", allowing an empty print.
-      amsMapping = Array.from({ length: 5 }, (_, i) =>
+      // X1/P1/A1 use the same one-entry-per-project-filament convention.
+      // A one-filament project printed from physical A3 must be [2], not a
+      // right- or left-padded five-entry legacy array.
+      const projLen = Math.max(projectMetadata.projectFilamentCount, baseMapping.length, 1);
+      amsMapping = Array.from({ length: projLen }, (_, i) =>
         i < baseMapping.length ? baseMapping[i] : -1
       );
       amsMapping2 = amsMapping.map((v) => {
