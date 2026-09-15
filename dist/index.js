@@ -13,6 +13,7 @@ import { BambuNetworkBridge } from "./bambu-network-bridge.js";
 import { hasAmsMappingInput, normalizeAmsMappingObject, normalizeBridgeAmsTrayValue } from "./ams-mapping.js";
 import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
 import { BambuImplementation } from "./printers/bambu.js";
+import { selectFilamentsForSlice } from "./slicer/filament-selection.js";
 dotenv.config();
 const DEFAULT_HOST = process.env.BAMBU_PRINTER_HOST || process.env.PRINTER_HOST || "localhost";
 const DEFAULT_BAMBU_SERIAL = process.env.BAMBU_PRINTER_SERIAL || process.env.BAMBU_SERIAL || "";
@@ -1538,7 +1539,9 @@ class BambuPrinterMCPServer {
                                     enum: ["textured_plate", "cool_plate", "engineering_plate", "hot_plate", "supertack_plate"],
                                     description: "Bed plate type for slicing (default: textured_plate). SuperTack is accepted only for pre-sliced print jobs until the BambuStudio CLI identifier is verified."
                                 },
-                                use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile." },
+                                use_printer_filaments: { type: "boolean", description: "When true, resolve the slicer filament from live AMS inventory. Automatic selection is allowed only when all resolvable loaded trays have one material type; otherwise filament_type or ams_slots is required." },
+                                filament_type: { type: "string", description: "Requested material type, such as PLA or ABS. It is resolved against live AMS inventory and slicing fails if no loaded tray matches." },
+                                ams_slots: { type: "array", items: { type: "number" }, description: "Exact zero-based physical AMS slots whose live filament profiles must be used for slicing, in filament order. A3 is slot 2. When filament_type is also supplied, every slot must match it." },
                                 host: { type: "string", description: "Hostname or IP of the printer (default: value from env)" },
                                 bambu_serial: { type: "string", description: "Serial number (default: value from env)" },
                                 bambu_token: { type: "string", description: "Access token (default: value from env)" },
@@ -1587,7 +1590,9 @@ class BambuPrinterMCPServer {
                                     enum: ["textured_plate", "cool_plate", "engineering_plate", "hot_plate", "supertack_plate"],
                                     description: "Bed plate type for slicing (default: textured_plate). SuperTack is accepted only for pre-sliced print jobs until the BambuStudio CLI identifier is verified."
                                 },
-                                use_printer_filaments: { type: "boolean", description: "When true, and no explicit slicer profile or load_filaments override is provided, use the printer's current or first loaded AMS filament as the slicer filament profile. Template 3MF process settings can still be used at the same time." },
+                                use_printer_filaments: { type: "boolean", description: "When true, resolve the slicer filament from live AMS inventory. Automatic selection is allowed only when all resolvable loaded trays have one material type; otherwise filament_type or ams_slots is required. Template 3MF process settings can still be used." },
+                                filament_type: { type: "string", description: "Requested material type, such as PLA or ABS. It is resolved against live AMS inventory and slicing fails if no loaded tray matches." },
+                                ams_slots: { type: "array", items: { type: "number" }, description: "Exact zero-based physical AMS slots whose live filament profiles must be used for slicing, in filament order. A3 is slot 2. When filament_type is also supplied, every slot must match it." },
                                 uptodate: { type: "boolean", description: "Refresh 3MF preset configs to match the latest BambuStudio version. Use when slicing downloaded or older 3MF files to prevent stale-config failures." },
                                 repetitions: { type: "number", description: "Print N identical copies of the model. Each copy gets its own plate placement. Example: 3 prints three copies." },
                                 orient: { type: "boolean", description: "Auto-orient the model for optimal printability (minimize supports, maximize bed adhesion). Recommended for raw STL imports that lack a pre-set orientation." },
@@ -2459,6 +2464,10 @@ class BambuPrinterMCPServer {
                         else if (args?.filament_profile !== undefined) {
                             sliceBambuOptions.loadFilaments = String(args.filament_profile);
                         }
+                        const hasMaterialSelection = args?.filament_type !== undefined || args?.ams_slots !== undefined;
+                        if (hasMaterialSelection && sliceBambuOptions.loadFilaments) {
+                            throw new Error("Do not combine filament_type or ams_slots with load_filaments/filament_profile; choose live AMS selection or explicit profile paths.");
+                        }
                         if (args?.load_filament_ids !== undefined)
                             sliceBambuOptions.loadFilamentIds = String(args.load_filament_ids);
                         sliceBambuOptions.bedType = resolveBambuStudioCliBedType(args?.bed_type);
@@ -2481,19 +2490,24 @@ class BambuPrinterMCPServer {
                         if (args?.slice_plate !== undefined)
                             sliceBambuOptions.slicePlate = Number(args.slice_plate);
                         const usePrinterFilaments = args?.use_printer_filaments !== undefined ? Boolean(args.use_printer_filaments) : true;
-                        if (usePrinterFilaments &&
-                            !explicitSlicerProfile &&
-                            !sliceBambuOptions.loadFilaments &&
-                            bambuSerial &&
-                            bambuToken) {
-                            try {
-                                const liveFilaments = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, sliceModel, nozzleDiam);
-                                if (liveFilaments.recommended?.load_filaments) {
-                                    sliceBambuOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+                        const shouldResolveLiveFilament = hasMaterialSelection || (usePrinterFilaments && !explicitSlicerProfile && !sliceBambuOptions.loadFilaments);
+                        if (shouldResolveLiveFilament) {
+                            if (!bambuSerial || !bambuToken) {
+                                if (hasMaterialSelection) {
+                                    throw new Error("filament_type and ams_slots require printer credentials so the live AMS material can be validated.");
                                 }
                             }
-                            catch (filamentError) {
-                                console.warn("Could not resolve live printer filaments for slicing:", filamentError);
+                            else {
+                                const liveFilaments = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, sliceModel, nozzleDiam);
+                                const selection = selectFilamentsForSlice(liveFilaments.trays, liveFilaments.current_slot, {
+                                    filamentType: args?.filament_type,
+                                    amsSlots: args?.ams_slots,
+                                    autoSelect: usePrinterFilaments,
+                                });
+                                if (selection) {
+                                    sliceBambuOptions.loadFilaments = selection.loadFilaments;
+                                    console.error(`[filament-selection] source=${selection.source} slots=${selection.slots.join(",")} materials=${selection.materialTypes.join(",")} profiles=${selection.loadFilaments}`);
+                                }
                             }
                         }
                         result = await this.stlManipulator.sliceSTL(String(args.stl_path), slicerType, slicerPath, activeSlicerProfile, undefined, printerPreset, sliceBambuOptions);
@@ -2536,6 +2550,10 @@ class BambuPrinterMCPServer {
                         else if (args?.filament_profile !== undefined) {
                             sliceBambuOptions.loadFilaments = String(args.filament_profile);
                         }
+                        const hasMaterialSelection = args?.filament_type !== undefined || args?.ams_slots !== undefined;
+                        if (hasMaterialSelection && sliceBambuOptions.loadFilaments) {
+                            throw new Error("Do not combine filament_type or ams_slots with load_filaments/filament_profile; choose live AMS selection or explicit profile paths.");
+                        }
                         if (args?.load_filament_ids !== undefined)
                             sliceBambuOptions.loadFilamentIds = String(args.load_filament_ids);
                         sliceBambuOptions.bedType = resolveBambuStudioCliBedType(args?.bed_type);
@@ -2558,19 +2576,24 @@ class BambuPrinterMCPServer {
                         if (args?.slice_plate !== undefined)
                             sliceBambuOptions.slicePlate = Number(args.slice_plate);
                         const usePrinterFilaments = args?.use_printer_filaments !== undefined ? Boolean(args.use_printer_filaments) : true;
-                        if (usePrinterFilaments &&
-                            !explicitSlicerProfile &&
-                            !sliceBambuOptions.loadFilaments &&
-                            bambuSerial &&
-                            bambuToken) {
-                            try {
-                                const liveFilaments = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, sliceModel, nozzleDiam);
-                                if (liveFilaments.recommended?.load_filaments) {
-                                    sliceBambuOptions.loadFilaments = liveFilaments.recommended.load_filaments;
+                        const shouldResolveLiveFilament = hasMaterialSelection || (usePrinterFilaments && !explicitSlicerProfile && !sliceBambuOptions.loadFilaments);
+                        if (shouldResolveLiveFilament) {
+                            if (!bambuSerial || !bambuToken) {
+                                if (hasMaterialSelection) {
+                                    throw new Error("filament_type and ams_slots require printer credentials so the live AMS material can be validated.");
                                 }
                             }
-                            catch (filamentError) {
-                                console.warn("Could not resolve live printer filaments for slicing:", filamentError);
+                            else {
+                                const liveFilaments = await this.getResolvedPrinterFilamentInventory(host, bambuSerial, bambuToken, sliceModel, nozzleDiam);
+                                const selection = selectFilamentsForSlice(liveFilaments.trays, liveFilaments.current_slot, {
+                                    filamentType: args?.filament_type,
+                                    amsSlots: args?.ams_slots,
+                                    autoSelect: usePrinterFilaments,
+                                });
+                                if (selection) {
+                                    sliceBambuOptions.loadFilaments = selection.loadFilaments;
+                                    console.error(`[filament-selection] source=${selection.source} slots=${selection.slots.join(",")} materials=${selection.materialTypes.join(",")} profiles=${selection.loadFilaments}`);
+                                }
                             }
                         }
                         result = await this.stlManipulator.sliceSTL(String(args.stl_path), slicerType, slicerPath, activeSlicerProfile, undefined, // progressCallback

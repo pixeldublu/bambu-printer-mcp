@@ -19,6 +19,7 @@ import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3M
 import { BambuImplementation } from "../dist/printers/bambu.js";
 import { STLManipulator } from "../dist/stl/stl-manipulator.js";
 import { injectPlateThumbnailsIfMissing } from "../dist/slicer/plate-thumbnail.js";
+import { selectFilamentsForSlice } from "../dist/slicer/filament-selection.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -217,6 +218,8 @@ const BAMBU_SLICER_OPTION_CONTRACTS = [
   ["skip_objects",          "string",  "skip"],
   ["load_filaments",        "string",  "filament"],
   ["load_filament_ids",     "string",  "filament"],
+  ["filament_type",         "string",  "material"],
+  ["ams_slots",             "array",   "ams"],
   ["bed_type",              "string",  "bed"],
   ["enable_timelapse",      "boolean", "timelapse"],
   ["allow_mix_temp",        "boolean", "temperature"],
@@ -228,6 +231,61 @@ const BAMBU_SLICER_OPTION_CONTRACTS = [
   ["skip_modified_gcodes",  "boolean", "gcode"],
   ["slice_plate",           "number",  "plate"],
 ];
+
+const LIVE_AMS_FIXTURE = [
+  { slot: 0, loaded: true, tray_type: "PLA", resolved_profile_path: "/profiles/pla.json" },
+  { slot: 1, loaded: false, tray_type: null, resolved_profile_path: null },
+  { slot: 2, loaded: true, tray_type: "ABS", resolved_profile_path: "/profiles/abs.json" },
+  { slot: 3, loaded: true, tray_type: "PLA", resolved_profile_path: "/profiles/pla-white.json" },
+];
+
+test("filament selection resolves requested ABS instead of the first loaded PLA", () => {
+  assert.deepEqual(
+    selectFilamentsForSlice(LIVE_AMS_FIXTURE, 0, { filamentType: "abs", autoSelect: true }),
+    {
+      source: "material-type",
+      loadFilaments: "/profiles/abs.json",
+      slots: [2],
+      materialTypes: ["ABS"],
+    }
+  );
+});
+
+test("filament selection validates an exact physical AMS slot against material", () => {
+  assert.deepEqual(
+    selectFilamentsForSlice(LIVE_AMS_FIXTURE, 0, { filamentType: "ABS", amsSlots: [2] }),
+    {
+      source: "explicit-slots",
+      loadFilaments: "/profiles/abs.json",
+      slots: [2],
+      materialTypes: ["ABS"],
+    }
+  );
+  assert.throws(
+    () => selectFilamentsForSlice(LIVE_AMS_FIXTURE, 0, { filamentType: "ABS", amsSlots: [0] }),
+    /Material mismatch: requested ABS, but AMS slot 0 contains PLA/
+  );
+});
+
+test("filament selection refuses ambiguous automatic PLA/ABS selection", () => {
+  assert.throws(
+    () => selectFilamentsForSlice(LIVE_AMS_FIXTURE, 0, { autoSelect: true }),
+    /Ambiguous loaded AMS materials \(PLA, ABS\).*Pass filament_type or ams_slots/
+  );
+});
+
+test("filament selection safely auto-selects when every loaded tray is PLA", () => {
+  const plaOnly = LIVE_AMS_FIXTURE.filter((tray) => tray.tray_type !== "ABS");
+  assert.deepEqual(
+    selectFilamentsForSlice(plaOnly, 3, { autoSelect: true }),
+    {
+      source: "single-material-auto",
+      loadFilaments: "/profiles/pla-white.json",
+      slots: [3],
+      materialTypes: ["PLA"],
+    }
+  );
+});
 
 test("printer model safety: schema requires bambu_model, rejects missing/invalid models", async (t) => {
   const transport = new StdioClientTransport({
