@@ -84,17 +84,6 @@ interface BambuPrintOptionsInternal {
    * ergonomic callers; `amsMapping` takes precedence if both are set.
    */
   amsSlots?: number[];
-  /**
-   * When true (default), the firmware is free to auto-match sliced filament
-   * profiles against physically loaded AMS trays. When false, the caller's
-   * `amsSlots` is treated as authoritative: the server pre-loads the
-   * requested tray via `ams_change_filament`, waits for it to settle, and
-   * omits `ams_mapping` from `project_file` so firmware cannot re-route.
-   * Set false when you know the requested material but the physical tray's
-   * `tray_info_idx` does not match the slicer profile (causing auto-match
-   * to either pick the wrong tray or reject the job).
-   */
-  autoMatchAms?: boolean;
   md5?: string;
 }
 
@@ -590,18 +579,12 @@ export class BambuImplementation {
       serial.startsWith("093") ||
       serial.startsWith("094") ||
       isH2ModelName(options.bambuModel);
-    // X1/P1/A1 firmware rejects ".gcode.3mf" as the on-printer filename
-    // ("Unsupported file path or name"). The local sliced container keeps its
-    // real .gcode.3mf extension -- only the remote name is rewritten to .3mf
-    // so the firmware parses it as a project file rather than plain gcode.
-    if (!isH2) {
-      remoteFileName = remoteFileName.replace(/\.gcode\.3mf$/i, ".3mf");
-    }
     const remoteProjectPath = isH2 ? remoteFileName : `cache/${remoteFileName}`;
     const remoteUploadPath = isH2 ? `/${remoteFileName}` : `/cache/${remoteFileName}`;
-    const projectUrl = isH2
-      ? `ftp:///${remoteFileName}`
-      : `file:///sdcard/${remoteProjectPath}`;
+    // Use the printer's documented FTP project URL form. Keeping the sliced
+    // `.gcode.3mf` filename intact lets the X1 identify this as a sliced
+    // project (with preview/metadata) instead of presenting it as custom G-code.
+    const projectUrl = `ftp:///${remoteProjectPath}`;
 
     // Upload via basic-ftp directly (bypasses bambu-js double-path bug)
     await this.ftpUpload(host, token, options.filePath, remoteUploadPath);
@@ -733,52 +716,14 @@ export class BambuImplementation {
     }
 
     const b = (v: any) => (v ? 1 : 0);
-    // X1/P1/A1 path: explicitly command the requested AMS tray to load, wait
-    // for it to fully settle (tray_now = requested AND ams main = IDLE for
-    // several consecutive status checks), then send project_file. Without
-    // this, the firmware can accept project_file while the mechanical load
-    // is still in progress and immediately reject with "Failed to start a
-    // new task: Filament loading/unloading not completed". When
-    // auto_match_ams is false, omit ams_mapping from project_file so the
-    // firmware uses the manually-loaded tray rather than re-matching.
-    if (
-      !isH2 &&
-      options.useAMS !== false &&
-      options.amsSlots &&
-      options.amsSlots.length > 0 &&
-      options.amsSlots[0] >= 0
-    ) {
-      const absoluteTray = options.amsSlots[0];
-      const amsId = Math.floor(absoluteTray / 4);
-      const slotId = absoluteTray % 4;
-      console.log(
-        `[X1] Pre-loading filament from AMS ${amsId} slot ${slotId} (absolute tray ${absoluteTray})...`
-      );
-      await printer.publish({
-        print: {
-          sequence_id: "0",
-          command: "ams_change_filament",
-          ams_id: amsId,
-          slot_id: slotId,
-          target: absoluteTray,
-          curr_temp: 0,
-          tar_temp: 0,
-        },
-      });
-      const settled = await this.waitForAmsTrayReady(printer, absoluteTray);
-      if (!settled) {
-        throw new Error(
-          `AMS did not reach a stable idle state for tray ${absoluteTray} within timeout; aborting print start to avoid race with filament load.`
-        );
-      }
-      console.log(`[X1] AMS ready; continuing to project_file`);
-    }
+    // Give every submission a fresh identity. Reusing "0" can make newer
+    // firmware treat a retry as a continuation of the previous failed job.
+    const submissionId = String(Date.now() % 2_147_483_647 || 1);
     let projectFileCmd: Record<string, any>;
     if (isH2) {
-      const submissionId = String(Date.now() & 0x7fffffff);
       projectFileCmd = {
         print: {
-          sequence_id: "0",
+          sequence_id: submissionId,
           command: "project_file",
           param: `Metadata/${projectMetadata.plateFileName}`,
           url: projectUrl,
@@ -806,12 +751,12 @@ export class BambuImplementation {
         },
       };
     } else {
-      const manualAmsSelection = options.autoMatchAms === false && options.amsSlots?.length;
       projectFileCmd = {
         print: {
           command: "project_file",
           param: `Metadata/${projectMetadata.plateFileName}`,
           url: projectUrl,
+          file: remoteFileName,
           subtask_name: options.projectName,
           md5,
           flow_cali: options.flowCalibration ?? true,
@@ -821,34 +766,32 @@ export class BambuImplementation {
           bed_type: options.bedType || "textured_plate",
           timelapse: options.timelapse ?? false,
           use_ams: options.useAMS !== false,
-          // For manual tray selection the explicit preload is authoritative.
-          // Keep the sliced mapping out of the X1 command, but do include the
-          // selected absolute tray as the legacy five-entry mapping expected
-          // by X1 firmware.
-          ...(manualAmsSelection ? { ams_mapping: [-1, -1, -1, -1, options.amsSlots![0]] } : { ams_mapping: amsMapping }),
+          ams_mapping: amsMapping,
           profile_id: "0",
-          project_id: "0",
-          sequence_id: "0",
-          subtask_id: "0",
-          task_id: "0",
+          project_id: submissionId,
+          sequence_id: submissionId,
+          subtask_id: submissionId,
+          task_id: submissionId,
         },
       };
     }
 
-    await printer.publish(projectFileCmd);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-
-    const postSubmit = printer.data ?? {};
-    const postState = String(postSubmit.gcode_state ?? "").toUpperCase();
-    if (postState === "FAILED") {
+    const submission = await this.publishProjectFileAndWait(
+      printer,
+      projectFileCmd,
+      isH2 ? 3_000 : 12_000
+    );
+    if (!isH2 && !submission.confirmed) {
       throw new Error(
-        `Printer rejected project_file: gcode_state=FAILED, print_error=${postSubmit.print_error ?? 0}, hms=${JSON.stringify(postSubmit.hms ?? [])}`
+        "Printer did not confirm the project_file request within 12 seconds. Check get_printer_status before retrying so the same job is not started twice."
       );
     }
 
     return {
       status: "success",
       message: `Uploaded and started 3MF print: ${options.projectName}`,
+      submissionConfirmed: submission.confirmed,
+      printerResponse: submission.response,
       remoteProjectPath,
       plateFile: projectMetadata.plateFileName,
       platePath: projectMetadata.plateInternalPath,
@@ -1734,48 +1677,59 @@ export class BambuImplementation {
   }
 
   /**
-   * Wait until the AMS has physically loaded the requested tray AND the
-   * AMS main state is IDLE for several consecutive checks. Race-prone if we
-   * only wait for `tray_now` because firmware reports the requested tray
-   * while the mechanical load/unload is still in progress.
+   * Publish a project_file request and correlate the printer's response with
+   * this submission. A stale FAILED state from an earlier attempt must not be
+   * treated as rejection of the new job.
    */
-  private async waitForAmsTrayReady(
+  private async publishProjectFileAndWait(
     printer: any,
-    absoluteTray: number,
-    timeoutMs = 60_000,
-    stableChecks = 3
-  ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    let stableReadyCount = 0;
-    while (Date.now() < deadline) {
-      const data = printer.data ?? {};
-      // The X1C's report puts these values in `print.ams`, while the AMS
-      // main state is a top-level `print.ams_status` field.
-      const rawAms = data.ams ?? {};
-      const trayNow = Number.parseInt(String(rawAms.tray_now ?? "-1"), 10);
-      const trayTarget = Number.parseInt(String(rawAms.tray_tar ?? "-1"), 10);
-      const rawAmsStatus = Number.parseInt(String(data.ams_status ?? "-1"), 10);
-      // AMS main state lives in the upper byte of the 16-bit ams_status.
-      // 0 = IDLE, 1/3 = loading/unloading motion, 2 = unknown. See the
-      // bambu-node / Bambu protocol notes.
-      const amsMainStatus = rawAmsStatus >= 0 ? (rawAmsStatus >> 8) & 255 : -1;
-      // Do not trust a cached AMS status after the explicit load command.
-      // tray_now == tray_tar is the printer's authoritative settled selection;
-      // firmware may keep the main status at 0x02/0x03 while idle at the
-      // hotend, which is not a mechanical load in progress.
-      const moving = amsMainStatus === 1 || amsMainStatus === 3;
-      if (trayNow === absoluteTray && trayTarget === absoluteTray && !moving) {
-        stableReadyCount += 1;
-        if (stableReadyCount >= stableChecks) {
-          console.log(`[AMS] Filament load fully settled for tray ${absoluteTray}`);
-          return true;
-        }
-      } else {
-        stableReadyCount = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    payload: Record<string, any>,
+    timeoutMs: number
+  ): Promise<{ confirmed: boolean; response?: Record<string, any> }> {
+    if (typeof printer.on !== "function" || typeof printer.off !== "function") {
+      await printer.publish(payload);
+      await sleep(COMMAND_SETTLE_MS);
+      return { confirmed: false };
     }
-    return false;
+
+    const sequenceId = String(payload?.print?.sequence_id ?? "");
+    let finish!: (value: { confirmed: boolean; response?: Record<string, any> }) => void;
+    let fail!: (error: Error) => void;
+    const responsePromise = new Promise<{ confirmed: boolean; response?: Record<string, any> }>(
+      (resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      }
+    );
+
+    const onRawMessage = (_topic: unknown, raw: unknown) => {
+      try {
+        const text = Buffer.isBuffer(raw) ? raw.toString() : String(raw ?? "");
+        const report = JSON.parse(text)?.print;
+        if (!report || report.command !== "project_file") return;
+        if (String(report.sequence_id ?? "") !== sequenceId) return;
+
+        const result = String(report.result ?? "").trim().toLowerCase();
+        if (result && result !== "success") {
+          const reason = report.reason || report.message || report.error || "unknown reason";
+          fail(new Error(`Printer rejected project_file: ${reason} (${JSON.stringify(report)})`));
+          return;
+        }
+        if (result === "success") finish({ confirmed: true, response: report });
+      } catch {
+        // Ignore non-JSON and unrelated MQTT traffic.
+      }
+    };
+
+    printer.on("rawMessage", onRawMessage);
+    const timer = setTimeout(() => finish({ confirmed: false }), timeoutMs);
+    try {
+      await printer.publish(payload);
+      return await responsePromise;
+    } finally {
+      clearTimeout(timer);
+      printer.off("rawMessage", onRawMessage);
+    }
   }
 
   async disconnectAll(): Promise<void> {

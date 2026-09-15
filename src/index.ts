@@ -3397,13 +3397,6 @@ class BambuPrinterMCPServer {
               useAMS: useAMS,
               amsMapping: finalAmsMapping,
               amsSlots: finalAmsSlots,
-              // Forward the caller's auto_match_ams flag verbatim. The
-              // printer-side path uses this to decide whether to also send
-              // ams_mapping in project_file (and skip the pre-load) or to
-              // pre-load the requested AMS tray and skip ams_mapping.
-              autoMatchAms: args?.auto_match_ams !== undefined
-                ? Boolean(args.auto_match_ams)
-                : undefined,
               bedType: printBedType,
               bedLeveling: args?.bed_leveling !== undefined ? Boolean(args.bed_leveling) : undefined,
               flowCalibration: args?.flow_calibration !== undefined ? Boolean(args.flow_calibration) : undefined,

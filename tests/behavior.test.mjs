@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -627,24 +628,25 @@ test("X1C ams_slots right-aligns a single filament in the legacy mapping", async
     plateFilamentIds: [0],
   });
   const bambu = new BambuImplementation();
-  let publishedPayload = null;
-  // AMS pre-load fixture: values are under print.ams; ams_status is a
-  // top-level print field in the X1C report. A non-motion status is accepted
-  // because some X1C firmware reports 0x300 after the load has settled.
-  // Simulate the printer reporting that tray 2 is loaded and AMS is settled.
-  const fakePrinter = {
-    data: {
-      ams: {
-        tray_now: 2,
-        tray_tar: 2,
-      },
-      ams_status: 0x200,
-    },
+  const publishedPayloads = [];
+  let uploadedPath = null;
+  const fakePrinter = Object.assign(new EventEmitter(), {
     publish: async (payload) => {
-      publishedPayload = payload;
+      publishedPayloads.push(payload);
+      queueMicrotask(() => {
+        fakePrinter.emit("rawMessage", "device/test/report", Buffer.from(JSON.stringify({
+          print: {
+            command: "project_file",
+            sequence_id: payload.print.sequence_id,
+            result: "success",
+          },
+        })));
+      });
     },
+  });
+  bambu.ftpUpload = async (_host, _token, _localPath, remotePath) => {
+    uploadedPath = remotePath;
   };
-  bambu.ftpUpload = async () => {};
   bambu.getPrinter = async () => fakePrinter;
 
   try {
@@ -659,9 +661,59 @@ test("X1C ams_slots right-aligns a single filament in the legacy mapping", async
     });
 
     assert.equal(result.status, "success");
+    assert.equal(result.submissionConfirmed, true);
+    assert.equal(publishedPayloads.length, 1, "print start must not issue a separate AMS load command");
+    const publishedPayload = publishedPayloads[0];
     assert.equal(publishedPayload?.print?.command, "project_file");
     assert.deepEqual(publishedPayload.print.ams_mapping, [-1, -1, -1, -1, 2]);
     assert.equal(publishedPayload.print.use_ams, true);
+    assert.match(uploadedPath, /^\/cache\/x1c-single-filament-.+\.gcode\.3mf$/);
+    assert.equal(publishedPayload.print.url, `ftp://${uploadedPath}`);
+    assert.equal(publishedPayload.print.file, path.basename(uploadedPath));
+    assert.notEqual(publishedPayload.print.task_id, "0");
+    assert.equal(publishedPayload.print.project_id, publishedPayload.print.task_id);
+    assert.equal(publishedPayload.print.subtask_id, publishedPayload.print.task_id);
+    assert.equal(publishedPayload.print.sequence_id, publishedPayload.print.task_id);
+  } finally {
+    fs.rmSync(threeMfPath, { force: true });
+  }
+});
+
+test("X1C project_file surfaces the correlated printer rejection", async () => {
+  const threeMfPath = await writeSliced3mfFixture({
+    name: "x1c-rejected",
+    plateFilamentIds: [0],
+  });
+  const bambu = new BambuImplementation();
+  const fakePrinter = Object.assign(new EventEmitter(), {
+    publish: async (payload) => {
+      queueMicrotask(() => {
+        fakePrinter.emit("rawMessage", "device/test/report", Buffer.from(JSON.stringify({
+          print: {
+            command: "project_file",
+            sequence_id: payload.print.sequence_id,
+            result: "failed",
+            reason: "unsupported file path or name",
+          },
+        })));
+      });
+    },
+  });
+  bambu.ftpUpload = async () => {};
+  bambu.getPrinter = async () => fakePrinter;
+
+  try {
+    await assert.rejects(
+      bambu.print3mf("127.0.0.1", "00X1CTEST000000", "TEST_TOKEN", {
+        projectName: "x1c-rejected",
+        filePath: threeMfPath,
+        bambuModel: "x1c",
+        plateIndex: 0,
+        useAMS: true,
+        amsSlots: [2],
+      }),
+      /Printer rejected project_file: unsupported file path or name/
+    );
   } finally {
     fs.rmSync(threeMfPath, { force: true });
   }
